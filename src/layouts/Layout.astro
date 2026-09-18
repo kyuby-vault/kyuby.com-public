@@ -1,0 +1,191 @@
+---
+// src/layouts/Layout.astro
+// Base layout for all pages with global styles and a slot for page content.
+interface Props {
+  title: string;
+  description?: string;
+  fullBleed?: boolean;
+}
+
+const { title, description = 'Edge-first infrastructure.', fullBleed = false } = Astro.props;
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content={description} />
+    <title>{title}</title>
+    <link rel="icon" type="image/svg+xml" href="/images/kyuby-logo.svg" />
+    <style>
+      /* ── Global styles ── */
+      *, *::before, *::after {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      :root {
+        --color-bg:       #FFF8E7;
+        --color-surface:  #FFFBF0;
+        --color-primary:  #FF8C42;
+        --color-accent:   #CC8500;
+        --color-text:     #333333;
+        --color-muted:    #888888;
+        --color-border:   #E8D8B0;
+        --font-main: 'Segoe UI', system-ui, -apple-system, sans-serif;
+        --radius: 12px;
+        --shadow: 0 2px 12px rgba(204, 133, 0, 0.12);
+      }
+
+      html {
+        background: var(--color-bg);
+        color: var(--color-text);
+        font-family: var(--font-main);
+        font-size: 16px;
+        line-height: 1.6;
+      }
+
+      body {
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+      }
+
+      main {
+        flex: 1;
+        width: 100%;
+        max-width: 900px;
+        margin: 0 auto;
+        padding: 2rem 1.25rem;
+      }
+
+      a {
+        color: var(--color-primary);
+        text-decoration: none;
+      }
+
+      a:hover {
+        text-decoration: underline;
+        color: var(--color-accent);
+      }
+
+      h1, h2, h3 {
+        line-height: 1.3;
+        color: var(--color-text);
+      }
+
+      /* ── Nav ── */
+      nav {
+        background: var(--color-surface);
+        border-bottom: 2px solid var(--color-border);
+        padding: 0.75rem 1.25rem;
+      }
+
+      nav ul {
+        display: flex;
+        gap: 1.5rem;
+        list-style: none;
+        max-width: 900px;
+        margin: 0 auto;
+        align-items: center;
+      }
+
+      nav a {
+        font-weight: 600;
+        color: var(--color-text);
+        transition: color 0.2s;
+      }
+
+      nav a:hover {
+        color: var(--color-primary);
+        text-decoration: none;
+      }
+
+      nav .nav-brand {
+        font-size: 1.2rem;
+        color: var(--color-primary);
+        font-weight: 700;
+        margin-right: auto;
+      }
+
+      /* ── Footer ── */
+      footer {
+        background: var(--color-surface);
+        border-top: 2px solid var(--color-border);
+        text-align: center;
+        padding: 1.25rem;
+        color: var(--color-muted);
+        font-size: 0.9rem;
+      }
+
+      footer a {
+        color: var(--color-muted);
+        margin: 0 0.5rem;
+        font-size: 1.4rem;
+        transition: color 0.2s;
+      }
+
+      footer a:hover {
+        color: var(--color-primary);
+        text-decoration: none;
+      }
+
+      @media (max-width: 600px) {
+        nav ul {
+          gap: 0.8rem;
+        }
+
+        nav .nav-brand {
+          font-size: 1rem;
+        }
+
+        nav a {
+          font-size: 0.88rem;
+        }
+      }
+    </style>
+  </head>
+  <body class:list={{ 'layout-full-bleed': fullBleed }}>
+    <!-- Site navigation -->
+    <nav>
+      <ul>
+        <li><a href="/" class="nav-brand">kyuby.com</a></li>
+        <li><a href="/">Home</a></li>
+        <li><a href="/chat">Chat</a></li>
+        <li><a href="/blog">Blog</a></li>
+        <li><a href="/about">About</a></li>
+      </ul>
+    </nav>
+
+    <!-- Page content -->
+    <main>
+      <slot />
+    </main>
+
+    <!-- Footer with social links -->
+    {!fullBleed && (
+      <footer>
+        <p style="margin-bottom:0.5rem;">
+          &copy; {new Date().getFullYear()} kyuby.com – Edge-first infrastructure.
+        </p>
+        <a href="https://github.com/kyuby" target="_blank" rel="noopener noreferrer">GitHub</a>
+      </footer>
+    )}
+  </body>
+</html>
+
+<style is:global>
+  body.layout-full-bleed {
+    overflow: hidden;
+  }
+
+  body.layout-full-bleed main {
+    max-width: none;
+    padding: 0;
+  }
+
+  body.layout-full-bleed nav {
+    border-bottom-width: 1px;
+  }
+</style>

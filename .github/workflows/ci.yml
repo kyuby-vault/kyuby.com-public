@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: ['main', 'feature/**', 'fix/**', 'feat/**']
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  WRANGLER_SEND_METRICS: 'false'
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      sha: ${{ steps.revision.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - id: revision
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Prepare export-compatible container inputs
+        run: bash .github/workflows/devpod/ci-image.sh --prepare
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ runner.temp }}/kyuby-devpod-build-cache
+          key: ${{ runner.os }}-devpod-${{ hashFiles('Containerfile', 'package-lock.json', '.github/workflows/devpod/**') }}
+          restore-keys: ${{ runner.os }}-devpod-
+      - name: Build the digest-pinned DevPod with layer caching and smoke assertions
+        run: bash .github/workflows/devpod/ci-image.sh
+      - name: Container gates (private full suite; public curated build gates)
+        run: node .github/workflows/devpod/invoke.mjs gates
+        env:
+          CONTAINER_ENGINE: docker
+
+  preview-deploy:
+    needs: gates
+    if: github.repository == 'kyuby-vault/kyuby.com-public' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: test
+      url: ${{ steps.deploy.outputs.url }}
+    concurrency:
+      group: preview-${{ github.head_ref || github.ref_name }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.gates.outputs.sha }}
+          persist-credentials: false
+      - id: preview
+        shell: bash
+        run: echo "branch=preview-$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Prepare export-compatible container inputs
+        run: bash .github/workflows/devpod/ci-image.sh --prepare
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ runner.temp }}/kyuby-devpod-build-cache
+          key: ${{ runner.os }}-devpod-${{ hashFiles('Containerfile', 'package-lock.json', '.github/workflows/devpod/**') }}
+          restore-keys: ${{ runner.os }}-devpod-
+      - name: Build the digest-pinned DevPod with layer caching and smoke assertions
+        run: bash .github/workflows/devpod/ci-image.sh
+      - name: Container gates (private full suite; public curated build gates)
+        run: node .github/workflows/devpod/invoke.mjs gates
+        env:
+          CONTAINER_ENGINE: docker
+      - name: Deploy Pages preview
+        id: deploy
+        shell: bash
+        env:
+          CONTAINER_ENGINE: docker
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          PREVIEW_BRANCH: ${{ steps.preview.outputs.branch }}
+          DEPLOY_SHA: ${{ needs.gates.outputs.sha }}
+          PAGES_LOG: ${{ runner.temp }}/pages-preview.log
+        run: |
+          set -euo pipefail
+          test -n "$CLOUDFLARE_API_TOKEN" && test -n "$CLOUDFLARE_ACCOUNT_ID"
+          test "$PREVIEW_BRANCH" != main
+          node .github/workflows/devpod/invoke.mjs upload-preview 2>&1 | tee "$PAGES_LOG"
+          node --input-type=module <<'NODE'
+          import { readFileSync, appendFileSync } from 'node:fs';
+          import { stripVTControlCharacters } from 'node:util';
+          const log = stripVTControlCharacters(readFileSync(process.env.PAGES_LOG, 'utf8'));
+          const url = log.match(/https:\/\/[a-z0-9-]+\.kyuby-com\.pages\.dev(?=[\s/]|$)/)?.[0];
+          if (!url) throw new Error('Wrangler did not report a Pages URL.');
+          appendFileSync(process.env.GITHUB_OUTPUT, `url=${url}\n`);
+          appendFileSync(process.env.GITHUB_STEP_SUMMARY, `Pages preview: ${url}\n`);
+          NODE

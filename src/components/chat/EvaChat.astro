@@ -1,0 +1,1158 @@
+<section class="eva-shell" id="eva-app" aria-label="Eva browser chat">
+  <aside class="sessions-panel" id="sessions-panel" aria-label="Conversations">
+    <div class="panel-heading">
+      <div>
+        <span class="eyebrow">Local conversations</span>
+        <h2>Sessions</h2>
+      </div>
+      <button class="icon-button mobile-only" id="close-sessions" type="button" title="Close sessions" aria-label="Close sessions">
+        <i data-lucide="x"></i>
+      </button>
+    </div>
+    <button class="command-button command-button--primary" id="new-session" type="button">
+      <i data-lucide="plus"></i>
+      New conversation
+    </button>
+    <ul class="session-list" id="session-list"></ul>
+    <div class="sessions-footer">
+      <button class="text-button text-button--danger" id="delete-session" type="button">
+        <i data-lucide="trash-2"></i>
+        Delete conversation
+      </button>
+    </div>
+  </aside>
+
+  <section class="chat-workspace">
+    <header class="chat-header">
+      <button class="icon-button mobile-only" id="open-sessions" type="button" title="Open sessions" aria-label="Open sessions">
+        <i data-lucide="menu"></i>
+      </button>
+      <div class="eva-identity" aria-label="Eva">
+        <div class="eva-mark" aria-hidden="true">E</div>
+        <div>
+          <div class="identity-line">
+            <h1>Eva</h1>
+            <span class="status-badge" id="runtime-status" data-tone="checking" aria-live="polite">Checking</span>
+          </div>
+          <p id="model-label">Preparing runtime check...</p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button class="command-button" id="load-model" type="button" disabled>
+          <i data-lucide="power"></i>
+          <span id="load-model-label">Load Eva from network</span>
+        </button>
+        <button class="icon-button" id="unload-model" type="button" title="Unload Eva" aria-label="Unload Eva" disabled>
+          <i data-lucide="power-off"></i>
+        </button>
+        <button class="icon-button" id="toggle-inspector" type="button" title="Open memory and runtime" aria-label="Open memory and runtime">
+          <i data-lucide="panel-right-open"></i>
+        </button>
+      </div>
+    </header>
+
+    <div class="load-progress" id="load-progress" hidden>
+      <div class="load-progress__copy">
+        <span id="load-progress-label">Preparing Eva...</span>
+        <span id="load-progress-value">0%</span>
+      </div>
+      <progress id="load-progress-bar" max="100" value="0">0%</progress>
+    </div>
+
+    <div class="runtime-notice" id="runtime-notice" role="status">
+      <i data-lucide="cpu"></i>
+      <span id="runtime-notice-text">Checking WebGPU and the Eva artifact...</span>
+      <button class="text-button" id="retry-runtime" type="button" hidden>Retry</button>
+    </div>
+
+    <div class="message-list" id="message-list" role="log" aria-live="polite" aria-label="Conversation">
+      <div class="empty-conversation" id="empty-conversation">
+        <div class="empty-mark" aria-hidden="true"><i data-lucide="sparkles"></i></div>
+        <h2>Start with what matters.</h2>
+        <p>Eva keeps this conversation and the memories you choose on this device.</p>
+      </div>
+    </div>
+
+    <div class="live-status" id="live-status" aria-live="assertive"></div>
+    <div class="live-status" id="context-paging-status" role="status" hidden></div>
+    <div id="compression-offer" hidden>
+      <p>The protected live window is still too large. Completed assistant text can be compressed explicitly; unfinished text is never summarized as complete.</p>
+      <button class="text-button" id="offer-compression" type="button">Review live-window compression</button>
+      <button class="text-button" id="retry-response" type="button">Retry current response</button>
+    </div>
+
+    <section class="recovery-preview" id="recovery-preview" hidden aria-label="Recovered unfinished response">
+      <p id="recovery-label">Recovered unfinished response — not sent to the model</p>
+      <div id="recovery-partial"></div>
+      <button class="text-button" id="continue-response" type="button" disabled>Continue</button>
+      <button class="text-button" id="stop-continuation" type="button">Stop</button>
+      <button class="text-button" id="discard-recovery" type="button">Dismiss recovered response</button>
+    </section>
+
+    <form class="composer" id="chat-form">
+      <label class="sr-only" for="message-input">Message Eva</label>
+      <textarea
+        id="message-input"
+        name="message"
+        rows="1"
+        maxlength="4000"
+        placeholder="Load Eva to begin"
+        disabled
+      ></textarea>
+      <div class="composer-actions">
+        <span class="composer-state" id="composer-state">Eva is not loaded</span>
+        <button class="icon-button icon-button--stop" id="stop-generation" type="button" title="Stop generation" aria-label="Stop generation" hidden>
+          <i data-lucide="square"></i>
+        </button>
+        <button class="icon-button icon-button--send" id="send-message" type="submit" title="Send message" aria-label="Send message" disabled>
+          <i data-lucide="send"></i>
+        </button>
+      </div>
+    </form>
+  </section>
+
+  <aside class="inspector" id="inspector" aria-label="Memory and runtime">
+    <div class="panel-heading">
+      <div>
+        <span class="eyebrow">On this device</span>
+        <h2>Context</h2>
+      </div>
+      <button class="icon-button" id="close-inspector" type="button" title="Close context panel" aria-label="Close context panel">
+        <i data-lucide="x"></i>
+      </button>
+    </div>
+
+    <div class="inspector-tabs" role="tablist" aria-label="Context views">
+      <button class="tab-button is-active" type="button" role="tab" aria-selected="true" data-tab="memory">Memory</button>
+      <button class="tab-button" type="button" role="tab" aria-selected="false" data-tab="profile">Profile</button>
+      <button class="tab-button" type="button" role="tab" aria-selected="false" data-tab="runtime">Runtime</button>
+    </div>
+
+    <section class="inspector-view" data-view="memory" role="tabpanel">
+      <div class="context-data-controls">
+        <label for="context-partition">Context partition</label>
+        <select id="context-partition" aria-label="Context partition"></select>
+        <label for="export-scope">Export scope</label>
+        <select id="export-scope">
+          <option value="model">This model's contexts</option>
+          <option value="all">All models and contexts</option>
+        </select>
+        <button class="command-button" id="import-data" type="button">Import local data</button>
+        <input id="import-file" type="file" accept="application/json,.json" hidden />
+        <p id="context-save-status" role="status">Committed messages and memories save immediately. Recovery checkpoints every 5 minutes and when hidden.</p>
+        <label for="synopsis-chapter">Story bible: chapter number</label>
+        <input id="synopsis-chapter" type="number" min="1" max="9999" value="1" />
+        <button class="command-button" id="create-synopsis" type="button">Create / update chapter synopsis</button>
+        <p id="synopsis-status" role="status">Explicit model-generated synopsis of the latest completed assistant turn. Raw text stays in memory; confirm before using synopsis + tail in the live window.</p>
+      </div>
+      <div class="view-heading">
+        <p>Saved memories</p>
+        <button class="icon-button" id="rebuild-memory-index" type="button" title="Rebuild memory index" aria-label="Rebuild memory index">
+          <i data-lucide="refresh-cw"></i>
+        </button>
+        <button class="icon-button" id="export-data" type="button" title="Export local data" aria-label="Export local data">
+          <i data-lucide="download"></i>
+        </button>
+      </div>
+      <ul class="memory-list" id="memory-list"></ul>
+      <p id="memory-index-status" role="status"></p>
+      <p class="empty-list" id="empty-memory">No saved memories.</p>
+    </section>
+
+    <section class="inspector-view" data-view="profile" role="tabpanel" hidden>
+      <form class="profile-form" id="profile-form">
+        <label for="profile-name">Display name</label>
+        <input id="profile-name" name="displayName" maxlength="80" autocomplete="name" />
+        <label for="profile-notes">Notes for Eva</label>
+        <textarea id="profile-notes" name="notes" rows="6" maxlength="2000"></textarea>
+        <button class="command-button command-button--primary" type="submit">
+          <i data-lucide="save"></i>
+          Save profile
+        </button>
+      </form>
+    </section>
+
+    <section class="inspector-view runtime-view" data-view="runtime" role="tabpanel" hidden>
+      <dl class="runtime-grid">
+        <div><dt>Provider</dt><dd id="runtime-provider">WebGPU</dd></div>
+        <div><dt>State</dt><dd id="runtime-state">Idle</dd></div>
+        <div><dt>Model</dt><dd id="runtime-model">-</dd></div>
+        <div><dt>Input tokens</dt><dd id="runtime-input-tokens">-</dd></div>
+        <div><dt>Generated tokens</dt><dd id="runtime-output-tokens">-</dd></div>
+        <div><dt>Last response</dt><dd id="runtime-elapsed">-</dd></div>
+        <div><dt>Context budget</dt><dd id="runtime-context-budget">Conservative defaults · 8192</dd></div>
+        <div><dt>Output budget</dt><dd id="runtime-output-budget">640 · conservative defaults</dd></div>
+        <div><dt>Budget provenance</dt><dd id="runtime-budget-provenance">Available after model load</dd></div>
+        <div><dt>Finish reason</dt><dd id="runtime-finish-reason">—</dd></div>
+        <div><dt>Window arithmetic</dt><dd id="runtime-wall-arithmetic">—</dd></div>
+        <div><dt>Continuation arithmetic</dt><dd id="runtime-continuation-arithmetic">—</dd></div>
+        <div><dt>Model files</dt><dd id="runtime-model-files">Checking…</dd></div>
+        <div><dt>Integrity</dt><dd id="runtime-integrity">Checking…</dd></div>
+        <div><dt>Load source</dt><dd id="runtime-load-source">—</dd></div>
+        <div><dt>Cache backend</dt><dd id="runtime-cache-backend">Checking…</dd></div>
+        <div><dt>Storage policy</dt><dd id="runtime-storage-policy">Checking…</dd></div>
+        <div><dt>Site storage</dt><dd id="runtime-site-storage">Checking…</dd></div>
+        <div><dt>Cache version</dt><dd id="runtime-cache-version">—</dd></div>
+        <div><dt>Manifest</dt><dd id="runtime-manifest">Checking…</dd></div>
+        <div><dt>Debug session ID</dt><dd id="runtime-session-id">—</dd></div>
+        <div><dt>Context model</dt><dd id="runtime-context-model">—</dd></div>
+        <div><dt>Context partition</dt><dd id="runtime-context-partition">—</dd></div>
+      </dl>
+      <div class="persistence-panel" id="persistence-panel">
+        <p class="persistence-banner" id="persistence-banner" data-tone="info" role="status" hidden></p>
+        <button class="command-button" id="request-persistence" type="button" hidden>
+          <i data-lucide="database-zap"></i>
+          <span id="request-persistence-label">Protect model files from browser cleanup</span>
+        </button>
+      </div>
+      <div class="experimental-panel">
+        <label for="kv-allowance">KV allowance (device limits still apply)</label>
+        <select id="kv-allowance">
+          <option value="conservative">Conservative · 1.00 GiB (default)</option>
+          <option value="balanced">Balanced · 1.50 GiB</option>
+          <option value="max">Max · 2.00 GiB</option>
+        </select>
+        <label class="experimental-toggle" for="auto-resume-disk">
+          <input type="checkbox" id="auto-resume-disk" checked />
+          Auto-resume from disk on page load
+        </label>
+        <label for="generation-token-limit">Output token ceiling (blank = derived)</label>
+        <input id="generation-token-limit" type="number" min="1" max="4096" step="1" placeholder="Derived" />
+        <label for="auto-continue">Auto-continue truncated replies</label>
+        <select id="auto-continue">
+          <option value="0">Off (default)</option>
+          <option value="1">Up to 1 time</option>
+          <option value="2">Up to 2 times</option>
+          <option value="3">Up to 3 times</option>
+        </select>
+        <label class="experimental-toggle" for="experimental-ui-toggle">
+          <input type="checkbox" id="experimental-ui-toggle" />
+          Experimental UI: taller composer, expandable messages
+        </label>
+      </div>
+      <div class="runtime-actions">
+        <button class="text-button" id="reverify-model" type="button" disabled>Re-verify now</button>
+        <button class="text-button text-button--danger" id="remove-local-model" type="button" disabled>
+          <i data-lucide="trash-2"></i>
+          Remove from this device
+        </button>
+        <button class="text-button text-button--danger" id="clear-local-data" type="button">
+          <i data-lucide="database-zap"></i>
+          Clear conversations, memory, and profile
+        </button>
+      </div>
+      <p id="cache-progress-summary" role="status"></p>
+      <label for="download-concurrency">Concurrent model transfers (next explicit load)</label>
+      <select id="download-concurrency"><option value="2">2 (default)</option><option value="4">4</option></select>
+      <button class="text-button" id="pause-download" type="button" disabled>Pause download</button>
+      <button class="text-button" id="resume-download" type="button" hidden>Resume download</button>
+      <p id="download-status" role="status">Completed Range chunks are resumable for 24 hours. Partial files are never served. Speed / ETA exclude final verification and inference setup.</p>
+      <ul id="cache-file-progress" aria-label="Model file progress"></ul>
+      <p id="reverify-summary" role="status"></p>
+      <ul id="reverify-results" aria-label="Local checksum results"></ul>
+      <p class="runtime-action-note">Clearing conversations, memory, and profile does not remove model files.</p>
+    </section>
+  </aside>
+
+  <div class="drawer-scrim" id="drawer-scrim" hidden></div>
+
+  <dialog class="confirm-dialog" id="import-dialog">
+    <form method="dialog">
+      <h2>Import local contexts?</h2>
+      <p id="import-preview"></p>
+      <ul class="import-targets" id="import-targets" aria-label="Included model and context partitions"></ul>
+      <p id="import-error" role="alert" hidden></p>
+      <label for="import-mode">Import mode</label>
+      <select id="import-mode">
+        <option value="merge">Merge (keep newer matching records)</option>
+        <option value="replace">Replace only the included context partitions</option>
+      </select>
+      <p>Replacement removes existing records in the included partitions. Other contexts and model files are untouched. Imported text never executes tools.</p>
+      <div class="dialog-actions">
+        <button class="command-button" value="cancel">Cancel</button>
+        <button class="command-button command-button--primary" id="confirm-import" value="confirm">Confirm import</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="confirm-dialog" id="clear-dialog">
+    <form method="dialog">
+      <h2>Clear conversations, memory, and profile?</h2>
+      <p>This removes all sessions, messages, memories, and profile details stored by this browser. Model files stay on this device.</p>
+      <div class="dialog-actions">
+        <button class="command-button" value="cancel">Cancel</button>
+        <button class="command-button command-button--danger" id="confirm-clear" value="confirm">Clear local data</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="confirm-dialog" id="remove-model-dialog">
+    <form method="dialog">
+      <h2>Remove Eva model files?</h2>
+      <p id="remove-model-copy">This removes the verified local Eva model files. Conversations, memories, and profile stay on this device.</p>
+      <div class="dialog-actions">
+        <button class="command-button" value="cancel">Cancel</button>
+        <button class="command-button command-button--danger" id="confirm-remove-model" value="confirm">Remove model</button>
+      </div>
+    </form>
+  </dialog>
+</section>
+
+<script>
+  import { mountEvaChat } from '../../lib/eva/chat-controller';
+
+  void mountEvaChat();
+</script>
+
+<style is:global>
+  .eva-shell {
+    --eva-ink: #17201d;
+    --eva-ink-soft: #46534e;
+    --eva-paper: #f5f5ef;
+    --eva-surface: #ffffff;
+    --eva-line: #cbd2ca;
+    --eva-mint: #9fcbb5;
+    --eva-mint-dark: #276247;
+    --eva-coral: #df674b;
+    --eva-gold: #dcae3e;
+    --eva-blue: #3e66b1;
+    display: grid;
+    grid-template-columns: 232px minmax(360px, 1fr) 300px;
+    height: calc(100dvh - 57px);
+    color: var(--eva-ink);
+    background-color: var(--eva-paper);
+    background-image:
+      linear-gradient(rgba(23, 32, 29, 0.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(23, 32, 29, 0.025) 1px, transparent 1px);
+    background-size: 24px 24px;
+    font-family: "Aptos", "Trebuchet MS", sans-serif;
+    letter-spacing: 0;
+  }
+
+  .eva-shell, .eva-shell * {
+    box-sizing: border-box;
+  }
+
+  .eva-shell.inspector-closed {
+    grid-template-columns: 232px minmax(360px, 1fr);
+  }
+
+  .eva-shell.inspector-closed .inspector {
+    display: none;
+  }
+
+  button, textarea, input {
+    font: inherit;
+    letter-spacing: 0;
+  }
+
+  button:focus-visible, textarea:focus-visible, input:focus-visible {
+    outline: 3px solid rgba(62, 102, 177, 0.35);
+    outline-offset: 2px;
+  }
+
+  .sessions-panel, .inspector {
+    min-width: 0;
+    background: rgba(255, 255, 255, 0.9);
+    backdrop-filter: blur(12px);
+  }
+
+  .sessions-panel {
+    display: flex;
+    flex-direction: column;
+    border-right: 1px solid var(--eva-line);
+    padding: 20px 14px 14px;
+  }
+
+  .inspector {
+    border-left: 1px solid var(--eva-line);
+    padding: 20px 16px;
+    overflow-y: auto;
+  }
+
+  .panel-heading, .view-heading, .identity-line, .chat-header, .composer-actions,
+  .load-progress__copy, .dialog-actions {
+    display: flex;
+    align-items: center;
+  }
+
+  .panel-heading, .view-heading, .chat-header, .load-progress__copy {
+    justify-content: space-between;
+  }
+
+  .panel-heading {
+    min-height: 48px;
+    margin-bottom: 16px;
+  }
+
+  .panel-heading h2, .empty-conversation h2, .confirm-dialog h2 {
+    font-family: "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+    font-size: 1.25rem;
+    font-weight: 600;
+  }
+
+  .eyebrow {
+    display: block;
+    margin-bottom: 1px;
+    color: var(--eva-ink-soft);
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+
+  .command-button, .text-button, .icon-button, .tab-button, .session-button {
+    border: 0;
+    cursor: pointer;
+  }
+
+  .command-button {
+    display: inline-flex;
+    min-height: 44px;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    border: 1px solid var(--eva-line);
+    border-radius: 6px;
+    padding: 8px 12px;
+    background: var(--eva-surface);
+    color: var(--eva-ink);
+    font-weight: 700;
+    white-space: nowrap;
+  }
+
+  .command-button:hover:not(:disabled), .icon-button:hover:not(:disabled) {
+    border-color: var(--eva-mint-dark);
+    color: var(--eva-mint-dark);
+  }
+
+  .command-button--primary {
+    border-color: var(--eva-ink);
+    background: var(--eva-ink);
+    color: #fff;
+  }
+
+  .command-button--primary:hover:not(:disabled) {
+    border-color: var(--eva-mint-dark);
+    background: var(--eva-mint-dark);
+    color: #fff;
+  }
+
+  .command-button--danger {
+    border-color: var(--eva-coral);
+    background: var(--eva-coral);
+    color: #fff;
+  }
+
+  .command-button:disabled, .icon-button:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
+
+  .icon-button {
+    display: inline-grid;
+    width: 44px;
+    height: 44px;
+    flex: 0 0 44px;
+    place-items: center;
+    border: 1px solid var(--eva-line);
+    border-radius: 6px;
+    background: var(--eva-surface);
+    color: var(--eva-ink);
+  }
+
+  .icon-button :global(svg), .command-button :global(svg), .text-button :global(svg) {
+    width: 18px;
+    height: 18px;
+  }
+
+  .icon-button--send {
+    border-color: var(--eva-ink);
+    background: var(--eva-ink);
+    color: #fff;
+  }
+
+  .icon-button--stop {
+    border-color: var(--eva-coral);
+    color: var(--eva-coral);
+  }
+
+  .text-button {
+    display: inline-flex;
+    min-height: 44px;
+    align-items: center;
+    gap: 7px;
+    padding: 6px 2px;
+    background: transparent;
+    color: var(--eva-blue);
+    font-weight: 700;
+  }
+
+  .text-button--danger {
+    color: #a33b29;
+  }
+
+  .session-list, .memory-list {
+    list-style: none;
+  }
+
+  .session-list {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    gap: 4px;
+    margin: 14px 0;
+    overflow-y: auto;
+  }
+
+  .session-button {
+    width: 100%;
+    min-height: 50px;
+    border-left: 3px solid transparent;
+    border-radius: 0 5px 5px 0;
+    padding: 8px 10px;
+    overflow: hidden;
+    background: transparent;
+    color: var(--eva-ink-soft);
+    text-align: left;
+  }
+
+  .session-button:hover, .session-button.is-active {
+    background: #edf4ef;
+    color: var(--eva-ink);
+  }
+
+  .session-button.is-active {
+    border-left-color: var(--eva-mint-dark);
+  }
+
+  .session-button strong, .session-button span {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .session-button strong {
+    font-size: 0.88rem;
+  }
+
+  .session-button span {
+    margin-top: 2px;
+    font-size: 0.7rem;
+  }
+
+  .sessions-footer {
+    border-top: 1px solid var(--eva-line);
+    padding-top: 10px;
+  }
+
+  .chat-workspace {
+    display: flex;
+    min-width: 0;
+    min-height: 0;
+    flex-direction: column;
+    background: rgba(245, 245, 239, 0.74);
+  }
+
+  .chat-header {
+    min-height: 78px;
+    gap: 14px;
+    border-bottom: 1px solid var(--eva-line);
+    padding: 12px 20px;
+    background: rgba(245, 245, 239, 0.92);
+    backdrop-filter: blur(10px);
+  }
+
+  .eva-identity {
+    display: flex;
+    min-width: 0;
+    flex: 1;
+    align-items: center;
+    gap: 11px;
+  }
+
+  .eva-mark, .empty-mark, .message-avatar {
+    display: grid;
+    place-items: center;
+    font-family: "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+    font-weight: 700;
+  }
+
+  .eva-mark {
+    width: 42px;
+    height: 42px;
+    flex: 0 0 42px;
+    border: 1px solid #19382a;
+    border-radius: 50%;
+    background: var(--eva-mint);
+    color: #173a2a;
+    font-size: 1.35rem;
+  }
+
+  .identity-line {
+    gap: 9px;
+  }
+
+  .identity-line h1 {
+    font-family: "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+    font-size: 1.55rem;
+    font-weight: 600;
+  }
+
+  .eva-identity p {
+    max-width: min(48vw, 520px);
+    overflow: hidden;
+    color: var(--eva-ink-soft);
+    font-size: 0.76rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .status-badge {
+    min-width: 64px;
+    border: 1px solid var(--eva-line);
+    border-radius: 999px;
+    padding: 2px 8px;
+    background: #fff;
+    color: var(--eva-ink-soft);
+    font-size: 0.67rem;
+    font-weight: 800;
+    text-align: center;
+  }
+
+  .status-badge[data-tone="ready"] { border-color: #5d9277; background: #e0f0e7; color: #215a3e; }
+  .status-badge[data-tone="warning"] { border-color: #d0aa43; background: #fff4cf; color: #715714; }
+  .status-badge[data-tone="error"] { border-color: #d58a79; background: #fbe7e1; color: #8d2d1e; }
+  .status-badge[data-tone="busy"] { border-color: #dab95d; background: #fff4cf; color: #715714; }
+
+  .header-actions {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+
+  .load-progress, .runtime-notice {
+    border-bottom: 1px solid var(--eva-line);
+    padding: 10px 20px;
+    background: #fffdf6;
+  }
+
+  .load-progress__copy {
+    margin-bottom: 6px;
+    color: var(--eva-ink-soft);
+    font-size: 0.74rem;
+    font-weight: 700;
+  }
+
+  .load-progress progress {
+    width: 100%;
+    height: 6px;
+    border: 0;
+    accent-color: var(--eva-mint-dark);
+  }
+
+  .runtime-notice {
+    display: flex;
+    min-height: 42px;
+    align-items: center;
+    gap: 9px;
+    color: var(--eva-ink-soft);
+    font-size: 0.78rem;
+  }
+
+  .runtime-notice[data-tone="limited-storage"] {
+    border-bottom-color: #d0aa43;
+    background: #fff4cf;
+    color: #5f4a14;
+  }
+
+  .runtime-notice :global(svg) {
+    width: 17px;
+    flex: 0 0 17px;
+  }
+
+  .runtime-notice .text-button {
+    margin-left: auto;
+  }
+
+  .message-list {
+    display: flex;
+    min-height: 0;
+    flex: 1;
+    flex-direction: column;
+    gap: 20px;
+    overflow-y: auto;
+    padding: 28px max(24px, calc((100% - 760px) / 2));
+    scroll-behavior: smooth;
+  }
+
+  .empty-conversation {
+    align-self: center;
+    max-width: 420px;
+    margin: auto;
+    text-align: center;
+  }
+
+  .empty-mark {
+    width: 48px;
+    height: 48px;
+    margin: 0 auto 14px;
+    border: 1px solid var(--eva-line);
+    border-radius: 50%;
+    background: #fff;
+    color: var(--eva-mint-dark);
+  }
+
+  .empty-conversation p {
+    margin-top: 8px;
+    color: var(--eva-ink-soft);
+    font-size: 0.9rem;
+  }
+
+  .message {
+    display: grid;
+    width: 100%;
+    min-width: 0;
+    max-width: 760px;
+    grid-template-columns: 32px minmax(0, 1fr);
+    gap: 10px;
+    align-self: stretch;
+  }
+
+  .message > :last-child {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .message-avatar {
+    width: 32px;
+    height: 32px;
+    border: 1px solid var(--eva-line);
+    border-radius: 50%;
+    background: #fff;
+    color: var(--eva-ink-soft);
+    font-size: 0.78rem;
+  }
+
+  .message--assistant .message-avatar { border-color: #69a384; background: #e0f0e7; color: #215a3e; }
+  .message--tool .message-avatar { border-radius: 5px; background: #fff1c9; color: #6f5513; }
+
+  .message-meta {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-bottom: 3px;
+  }
+
+  .message-meta strong { font-size: 0.8rem; }
+  .message-meta time { color: var(--eva-ink-soft); font-size: 0.68rem; }
+
+  .message-content {
+    max-width: 100%;
+    overflow: visible;
+    overflow-wrap: anywhere;
+    color: var(--eva-ink);
+    font-family: "Charter", "Bitstream Charter", Georgia, serif;
+    font-size: 0.98rem;
+    line-height: 1.58;
+    white-space: pre-wrap;
+  }
+
+  .message--tool .message-content {
+    color: var(--eva-ink-soft);
+    font-family: "Cascadia Code", Consolas, monospace;
+    font-size: 0.74rem;
+  }
+
+  .message--pending .message-content::after {
+    display: inline-block;
+    width: 7px;
+    height: 15px;
+    margin-left: 3px;
+    background: var(--eva-mint-dark);
+    content: "";
+    animation: cursor-blink 0.85s steps(1) infinite;
+    vertical-align: -2px;
+  }
+
+  @keyframes cursor-blink { 50% { opacity: 0; } }
+
+  .live-status {
+    min-height: 22px;
+    padding: 0 max(24px, calc((100% - 760px) / 2));
+    color: #9b3524;
+    font-size: 0.76rem;
+  }
+
+  .composer {
+    width: min(800px, calc(100% - 32px));
+    flex: 0 0 auto;
+    margin: 4px auto 18px;
+    overflow: visible;
+    border: 1px solid #adb9b1;
+    border-radius: 7px;
+    background: #fff;
+    box-shadow: 0 8px 28px rgba(23, 32, 29, 0.1);
+  }
+
+  .composer textarea {
+    display: block;
+    width: 100%;
+    min-height: 60px;
+    max-height: min(320px, 40dvh);
+    resize: vertical;
+    overflow-y: auto;
+    border: 0;
+    border-radius: 7px 7px 0 0;
+    padding: 14px 16px 8px;
+    background: transparent;
+    color: var(--eva-ink);
+    line-height: 1.45;
+  }
+
+  .composer textarea:focus { outline: 0; }
+
+  .composer-actions {
+    min-height: 48px;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 4px 7px 7px 14px;
+  }
+
+  .composer-state {
+    margin-right: auto;
+    color: var(--eva-ink-soft);
+    font-size: 0.72rem;
+  }
+
+  .inspector-tabs {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    border-bottom: 1px solid var(--eva-line);
+    margin-bottom: 16px;
+  }
+
+  .tab-button {
+    min-height: 44px;
+    border-bottom: 3px solid transparent;
+    background: transparent;
+    color: var(--eva-ink-soft);
+    font-size: 0.76rem;
+    font-weight: 800;
+  }
+
+  .tab-button.is-active {
+    border-bottom-color: var(--eva-mint-dark);
+    color: var(--eva-ink);
+  }
+
+  .view-heading {
+    gap: 10px;
+    margin-bottom: 14px;
+  }
+
+  .view-heading p, .empty-list {
+    color: var(--eva-ink-soft);
+    font-size: 0.78rem;
+    line-height: 1.45;
+  }
+
+  .context-data-controls { display: grid; gap: 7px; margin-bottom: 14px; }
+  .context-data-controls label, #context-save-status { font-size: 0.72rem; color: var(--eva-ink-soft); }
+  .context-data-controls select, #import-mode { max-width: 100%; min-width: 0; padding: 7px; }
+  .recovery-preview { margin: 0 16px; padding: 8px 12px; border: 1px solid var(--eva-line); background: #fffdf6; font-size: 0.76rem; }
+  #recovery-partial { max-height: 100px; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+  .memory-list {
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+  }
+
+  .memory-item {
+    border-left: 3px solid var(--eva-gold);
+    padding: 8px 8px 8px 11px;
+    background: #fffdf6;
+  }
+
+  .memory-item p {
+    overflow-wrap: anywhere;
+    font-family: "Charter", "Bitstream Charter", Georgia, serif;
+    font-size: 0.82rem;
+    line-height: 1.45;
+  }
+
+  .memory-item footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 7px;
+    color: var(--eva-ink-soft);
+    font-size: 0.66rem;
+  }
+
+  .memory-item button {
+    display: inline-grid;
+    width: 44px;
+    height: 44px;
+    place-items: center;
+    border: 0;
+    background: transparent;
+    color: #a33b29;
+    cursor: pointer;
+  }
+
+  .memory-item button svg {
+    width: 17px;
+    height: 17px;
+  }
+
+  .profile-form {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .profile-form label {
+    margin-top: 6px;
+    font-size: 0.74rem;
+    font-weight: 800;
+  }
+
+  .profile-form input, .profile-form textarea {
+    width: 100%;
+    border: 1px solid var(--eva-line);
+    border-radius: 5px;
+    padding: 9px 10px;
+    background: #fff;
+    color: var(--eva-ink);
+  }
+
+  .runtime-grid {
+    display: grid;
+    gap: 0;
+    margin-bottom: 20px;
+  }
+
+  .runtime-grid div {
+    display: grid;
+    grid-template-columns: 92px minmax(0, 1fr);
+    gap: 8px;
+    border-bottom: 1px solid #e2e5df;
+    padding: 9px 0;
+  }
+
+  .runtime-grid dt { color: var(--eva-ink-soft); font-size: 0.7rem; }
+  .runtime-grid dd { overflow-wrap: anywhere; font-size: 0.72rem; font-weight: 700; }
+
+  .runtime-actions {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .runtime-action-note {
+    margin-top: 4px;
+    color: var(--eva-ink-soft);
+    font-size: 0.7rem;
+    line-height: 1.4;
+  }
+
+  .persistence-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 16px;
+  }
+
+  .persistence-banner {
+    margin: 0;
+    border: 1px solid var(--eva-line);
+    border-radius: 6px;
+    padding: 9px 11px;
+    font-size: 0.76rem;
+    line-height: 1.45;
+  }
+
+  .persistence-banner[data-tone="ok"] {
+    border-color: #69a384;
+    background: #e0f0e7;
+    color: #215a3e;
+  }
+
+  .persistence-banner[data-tone="warn"] {
+    border-color: #d0aa43;
+    background: #fff4cf;
+    color: #5f4a14;
+  }
+
+  .persistence-banner[data-tone="info"] {
+    background: #eef2f6;
+    color: var(--eva-ink-soft);
+  }
+
+  #request-persistence {
+    justify-content: center;
+    gap: 8px;
+    white-space: normal;
+    min-width: 0;
+    height: auto;
+  }
+
+  .experimental-panel {
+    display: grid;
+    gap: 8px;
+    margin-top: 16px;
+    border-top: 1px solid var(--eva-line);
+    padding-top: 14px;
+  }
+
+  .experimental-panel > input, .experimental-panel > select {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .experimental-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--eva-ink-soft);
+    font-size: 0.76rem;
+    cursor: pointer;
+  }
+
+  .experimental-toggle input { accent-color: var(--eva-mint-dark); }
+
+  /* Experimental opt-in UI. Everything below applies only after the user
+     explicitly enables it; the default theme and layout are unchanged. */
+  .eva-shell.experimental-ui .composer textarea {
+    max-height: 70dvh;
+  }
+
+  .eva-shell.experimental-ui .message--collapsible .message-content {
+    cursor: pointer;
+    border-radius: 6px;
+  }
+
+  .eva-shell.experimental-ui .message--collapsible .message-content:hover {
+    background: rgba(23, 32, 29, 0.04);
+  }
+
+  .eva-shell.experimental-ui .message--collapsed .message-content {
+    display: -webkit-box;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 4;
+  }
+
+  .eva-shell.experimental-ui .message-collapse-hint {
+    align-self: flex-start;
+    margin-top: 3px;
+    border: 0;
+    background: transparent;
+    color: var(--eva-blue);
+    font-size: 0.68rem;
+    font-weight: 700;
+    cursor: pointer;
+    padding: 0;
+  }
+
+  .drawer-scrim {
+    position: fixed;
+    z-index: 30;
+    inset: 0;
+    background: rgba(15, 24, 20, 0.42);
+  }
+
+  .import-targets {
+    max-height: 8rem;
+    overflow: auto;
+    overflow-wrap: anywhere;
+    padding-inline-start: 1.25rem;
+  }
+
+  #cache-file-progress, #reverify-results {
+    padding-inline-start: 1rem;
+    font-size: 0.75rem;
+    overflow-wrap: anywhere;
+  }
+
+  .recovery-preview { max-height: 220px; overflow: auto; flex-shrink: 0; }
+
+  .confirm-dialog {
+    width: min(420px, calc(100% - 32px));
+    border: 1px solid var(--eva-line);
+    border-radius: 7px;
+    padding: 22px;
+    color: var(--eva-ink);
+  }
+
+  .confirm-dialog::backdrop { background: rgba(15, 24, 20, 0.5); }
+  .confirm-dialog p { margin: 10px 0 20px; color: var(--eva-ink-soft); }
+  .dialog-actions { justify-content: flex-end; gap: 8px; }
+
+  .mobile-only { display: none; }
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+  }
+
+  [hidden] { display: none !important; }
+
+  @media (max-width: 1120px) {
+    .eva-shell { grid-template-columns: 220px minmax(360px, 1fr); }
+    .inspector {
+      position: fixed;
+      z-index: 40;
+      top: 0;
+      right: 0;
+      width: min(340px, calc(100vw - 48px));
+      height: 100dvh;
+      border-left: 1px solid var(--eva-line);
+      box-shadow: -12px 0 32px rgba(23, 32, 29, 0.18);
+      transform: translateX(105%);
+      transition: transform 180ms ease;
+    }
+    .inspector.is-open { transform: translateX(0); }
+  }
+
+  @media (max-width: 760px) {
+    .eva-shell { display: block; height: calc(100dvh - 56px); }
+    .mobile-only { display: inline-grid; }
+    .sessions-panel {
+      position: fixed;
+      z-index: 40;
+      top: 0;
+      left: 0;
+      width: min(300px, calc(100vw - 48px));
+      height: 100dvh;
+      box-shadow: 12px 0 32px rgba(23, 32, 29, 0.18);
+      transform: translateX(-105%);
+      transition: transform 180ms ease;
+    }
+    .sessions-panel.is-open { transform: translateX(0); }
+    .chat-workspace { width: 100%; height: 100%; min-height: 0; overflow: hidden; }
+    .chat-header { min-height: 68px; gap: 6px; padding: 9px 10px; }
+    .eva-mark { display: none; }
+    .identity-line h1 { font-size: 1.3rem; }
+    .eva-identity p { max-width: 38vw; }
+    .header-actions .command-button { width: 44px; padding: 0; font-size: 0; }
+    .header-actions .command-button :global(svg) { width: 18px; }
+    .message-list { padding: 20px 14px; }
+    .live-status { padding: 0 16px; }
+    .composer { width: auto; max-width: none; margin: 4px 10px 10px; }
+    .runtime-notice, .load-progress { padding-right: 12px; padding-left: 12px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      scroll-behavior: auto !important;
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+</style>

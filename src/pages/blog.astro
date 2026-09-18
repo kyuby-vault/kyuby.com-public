@@ -1,0 +1,88 @@
+---
+// src/pages/blog.astro
+// Blog listing page – shows all posts with title, date, and description.
+import Layout from '../layouts/Layout.astro';
+import { getCollection } from 'astro:content';
+
+const posts = (await getCollection('blog')).sort(
+  (a, b) => b.data.date.valueOf() - a.data.date.valueOf()
+);
+---
+
+<Layout title="Blog – kyuby.com" description="Articles and updates from the kyuby team.">
+  <h1 class="page-title">Blog</h1>
+  <p class="page-sub">Thoughts on edge infrastructure, open source, and the web.</p>
+
+  <ul class="post-list">
+    {posts.map((post) => (
+      <li class="post-card">
+        <a class="post-link" href={`/blog/${post.slug}`}>
+          <h2 class="post-title">{post.data.title}</h2>
+        </a>
+        <p class="post-desc">{post.data.description}</p>
+        <time class="post-date" datetime={post.data.date.toISOString()}>
+          {post.data.date.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}
+        </time>
+      </li>
+    ))}
+  </ul>
+</Layout>
+
+<style>
+  .page-title {
+    font-size: 2rem;
+    font-weight: 700;
+    margin-bottom: 0.25rem;
+  }
+
+  .page-sub {
+    color: #888;
+    margin-bottom: 2rem;
+  }
+
+  .post-list {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 1.25rem;
+  }
+
+  .post-card {
+    background: #FFFBF0;
+    border: 1px solid #E8D8B0;
+    border-radius: 12px;
+    padding: 1.25rem 1.5rem;
+    transition: box-shadow 0.2s, border-color 0.2s;
+  }
+
+  .post-card:hover {
+    box-shadow: 0 4px 16px rgba(255, 140, 66, 0.18);
+    border-color: #FF8C42;
+  }
+
+  .post-link {
+    text-decoration: none;
+  }
+
+  .post-title {
+    font-size: 1.2rem;
+    color: #333;
+    margin-bottom: 0.4rem;
+    transition: color 0.2s;
+  }
+
+  .post-link:hover .post-title {
+    color: #FF8C42;
+  }
+
+  .post-desc {
+    color: #555;
+    font-size: 0.95rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .post-date {
+    font-size: 0.82rem;
+    color: #999;
+  }
+</style>

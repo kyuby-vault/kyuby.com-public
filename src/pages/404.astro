@@ -1,0 +1,94 @@
+---
+// src/pages/404.astro
+// Custom 404 error page.
+import Layout from '../layouts/Layout.astro';
+---
+
+<Layout title="404 – Page Not Found | kyuby.com">
+  <div class="error-page">
+    <div class="error-emoji">🐱</div>
+    <h1 class="error-code">404</h1>
+    <p class="error-message">Oops! The page you're looking for doesn't exist.</p>
+    <p class="error-hint">
+      The kyuby cat couldn't find it either. Let's get you back on track.
+    </p>
+    <div class="error-actions">
+      <a class="btn btn-home" href="/">Go Home</a>
+      <a class="btn btn-blog" href="/blog">Read the Blog</a>
+    </div>
+  </div>
+</Layout>
+
+<style>
+  .error-page {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    padding: 3rem 1rem;
+    gap: 1rem;
+  }
+
+  .error-emoji {
+    font-size: 4rem;
+  }
+
+  .error-code {
+    font-size: clamp(4rem, 15vw, 8rem);
+    font-weight: 700;
+    color: #FF8C42;
+    line-height: 1;
+  }
+
+  .error-message {
+    font-size: 1.2rem;
+    font-weight: 600;
+    color: #333;
+  }
+
+  .error-hint {
+    color: #888;
+    font-size: 0.95rem;
+    max-width: 360px;
+  }
+
+  .error-actions {
+    display: flex;
+    gap: 1rem;
+    flex-wrap: wrap;
+    justify-content: center;
+    margin-top: 1rem;
+  }
+
+  .btn {
+    display: inline-block;
+    padding: 0.65rem 1.5rem;
+    border-radius: 999px;
+    font-weight: 600;
+    font-size: 0.95rem;
+    transition: transform 0.15s, box-shadow 0.15s;
+    text-decoration: none;
+  }
+
+  .btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px rgba(0,0,0,0.12);
+    text-decoration: none;
+  }
+
+  .btn-home {
+    background: #FF8C42;
+    color: #fff;
+  }
+
+  .btn-blog {
+    background: #fff;
+    color: #333;
+    border: 2px solid #E8D8B0;
+  }
+
+  .btn-blog:hover {
+    border-color: #FF8C42;
+    color: #FF8C42;
+  }
+</style>

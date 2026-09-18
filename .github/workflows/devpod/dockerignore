@@ -1,0 +1,23 @@
+# Deny by default: image needs dependency manifests and reviewed launcher files only.
+**
+!Containerfile
+!Makefile
+!package.json
+!package-lock.json
+!.nvmrc
+!.github/
+!.github/workflows/
+!.github/workflows/devpod/
+!.github/workflows/devpod/**
+.git/
+.credentials/
+**/.credentials/
+.env*
+**/.env*
+.dev.vars*
+**/.dev.vars*
+node_modules/
+dist/
+test-results/
+.wrangler/
+.export-tmp/

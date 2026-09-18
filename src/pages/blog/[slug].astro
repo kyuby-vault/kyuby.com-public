@@ -1,0 +1,124 @@
+---
+// src/pages/blog/[slug].astro
+// Dynamic route that renders an individual blog post.
+import Layout from '../../layouts/Layout.astro';
+import { getCollection } from 'astro:content';
+
+export async function getStaticPaths() {
+  const posts = await getCollection('blog');
+  return posts.map((post) => ({
+    params: { slug: post.slug },
+    props:  { post },
+  }));
+}
+
+const { post } = Astro.props;
+const { Content } = await post.render();
+---
+
+<Layout title={`${post.data.title} – kyuby.com`} description={post.data.description}>
+  <article class="post">
+    <header class="post-header">
+      <a class="back-link" href="/blog">← Back to blog</a>
+      <h1 class="post-title">{post.data.title}</h1>
+      <time class="post-date" datetime={post.data.date.toISOString()}>
+        {post.data.date.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}
+      </time>
+    </header>
+
+    <div class="post-body">
+      <Content />
+    </div>
+  </article>
+</Layout>
+
+<style>
+  .post {
+    max-width: 720px;
+    margin: 0 auto;
+  }
+
+  .post-header {
+    margin-bottom: 2rem;
+  }
+
+  .back-link {
+    display: inline-block;
+    font-size: 0.9rem;
+    color: #888;
+    margin-bottom: 1rem;
+    transition: color 0.2s;
+  }
+
+  .back-link:hover {
+    color: #FF8C42;
+    text-decoration: none;
+  }
+
+  .post-title {
+    font-size: clamp(1.6rem, 5vw, 2.2rem);
+    font-weight: 700;
+    margin-bottom: 0.4rem;
+  }
+
+  .post-date {
+    font-size: 0.85rem;
+    color: #999;
+  }
+
+  /* Prose styles for markdown content */
+  .post-body {
+    line-height: 1.8;
+    color: #444;
+  }
+
+  .post-body :global(h1),
+  .post-body :global(h2),
+  .post-body :global(h3) {
+    color: #333;
+    margin-top: 1.8rem;
+    margin-bottom: 0.6rem;
+  }
+
+  .post-body :global(p) {
+    margin-bottom: 1rem;
+  }
+
+  .post-body :global(ul),
+  .post-body :global(ol) {
+    padding-left: 1.5rem;
+    margin-bottom: 1rem;
+  }
+
+  .post-body :global(li) {
+    margin-bottom: 0.3rem;
+  }
+
+  .post-body :global(a) {
+    color: #FF8C42;
+  }
+
+  .post-body :global(code) {
+    background: #F5E6C8;
+    border-radius: 4px;
+    padding: 0.15em 0.4em;
+    font-size: 0.9em;
+  }
+
+  .post-body :global(pre) {
+    background: #2d2d2d;
+    color: #f8f8f2;
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+    overflow-x: auto;
+    margin-bottom: 1rem;
+  }
+
+  .post-body :global(blockquote) {
+    border-left: 4px solid #FF8C42;
+    padding-left: 1rem;
+    color: #666;
+    font-style: italic;
+    margin: 1rem 0;
+  }
+</style>

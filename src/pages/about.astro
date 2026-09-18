@@ -1,0 +1,68 @@
+---
+// src/pages/about.astro
+// About page – placeholder content that can be expanded later.
+import Layout from '../layouts/Layout.astro';
+---
+
+<Layout title="About – kyuby.com" description="Learn more about kyuby and its mission.">
+  <h1 class="page-title">About kyuby</h1>
+
+  <div class="about-content">
+    <p>
+      <strong>kyuby.com</strong> is a platform built on edge-first infrastructure principles.
+      We're passionate about reducing latency, increasing reliability, and pushing compute
+      closer to where it matters most – your users.
+    </p>
+
+    <h2>Our Mission</h2>
+    <p>
+      <!-- TODO: Replace with your real mission statement -->
+      We're building tools and services that make edge computing accessible to everyone.
+      Whether you're a solo developer or a growing team, kyuby aims to give you the same
+      infrastructure superpowers that large enterprises enjoy.
+    </p>
+
+    <h2>The Team</h2>
+    <p>
+      <!-- TODO: Add real team information here -->
+      kyuby is a small, distributed team of engineers and designers who care deeply about
+      developer experience and performance.
+    </p>
+
+    <h2>Get in Touch</h2>
+    <p>
+      Find us on <a href="https://github.com/kyuby-vault" target="_blank" rel="noopener noreferrer">GitHub</a>
+      or drop us an email. We'd love to hear from you.
+    </p>
+  </div>
+</Layout>
+
+<style>
+  .page-title {
+    font-size: 2rem;
+    font-weight: 700;
+    margin-bottom: 1.5rem;
+  }
+
+  .about-content {
+    max-width: 720px;
+    line-height: 1.8;
+    color: #444;
+  }
+
+  .about-content h2 {
+    font-size: 1.3rem;
+    font-weight: 700;
+    color: #333;
+    margin-top: 2rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .about-content p {
+    margin-bottom: 1rem;
+  }
+
+  .about-content a {
+    color: #FF8C42;
+  }
+</style>
