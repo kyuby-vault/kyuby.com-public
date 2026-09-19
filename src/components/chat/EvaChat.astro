@@ -192,6 +192,7 @@
         <div><dt>Cache backend</dt><dd id="runtime-cache-backend">Checking…</dd></div>
         <div><dt>Storage policy</dt><dd id="runtime-storage-policy">Checking…</dd></div>
         <div><dt>Site storage</dt><dd id="runtime-site-storage">Checking…</dd></div>
+        <div><dt>Download storage preflight</dt><dd id="acquisition-capacity">Checking…</dd></div>
         <div><dt>Cache version</dt><dd id="runtime-cache-version">—</dd></div>
         <div><dt>Manifest</dt><dd id="runtime-manifest">Checking…</dd></div>
         <div><dt>Debug session ID</dt><dd id="runtime-session-id">—</dd></div>
@@ -247,6 +248,7 @@
       <button class="text-button" id="pause-download" type="button" disabled>Pause download</button>
       <button class="text-button" id="resume-download" type="button" hidden>Resume download</button>
       <p id="download-status" role="status">Completed Range chunks are resumable for 24 hours. Partial files are never served. Speed / ETA exclude final verification and inference setup.</p>
+      <p id="download-visibility-hint" role="status" hidden></p>
       <ul id="cache-file-progress" aria-label="Model file progress"></ul>
       <p id="reverify-summary" role="status"></p>
       <ul id="reverify-results" aria-label="Local checksum results"></ul>

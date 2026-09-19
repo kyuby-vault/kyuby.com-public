@@ -44,7 +44,7 @@ export function main(command, env = process.env) {
   if (!['deploy-prod', 'prod-check'].includes(command)) throw new Error('Unknown host target.');
   const git = (args) => run('git', args, { capture: true });
   assertProductionLocal(git(['branch', '--show-current']), git(['status', '--porcelain', '--untracked-files=all']), env);
-  // This unchanged host script checks private origin, fresh remote HEAD equality,
+  // This host script checks private origin, fresh remote HEAD equality,
   // exact-SHA CI run/suite/checks, and the curated public snapshot provenance.
   run(hostBash(), ['scripts/export-public.sh', '--assert-synced']);
   const sha = git(['-C', '.export-tmp/kyuby.com-public', 'rev-parse', 'refs/remotes/origin/main']);

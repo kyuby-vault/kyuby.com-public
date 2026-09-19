@@ -68,7 +68,9 @@ export interface ModelCacheTemporaryRecord {
   backend: ModelCacheBackendKind;
   locator: string;
   createdAt: number;
-  resume?: { bytes: number; sha256: string; offset: number };
+  // Identity is pinned to the validated manifest SHA-256; host ETags are NOT
+  // trusted for shard identity. Closed prefixes are durable, never verified files.
+  resume?: { bytes: number; sha256: string; offset: number; verifiedPrefix?: false };
 }
 
 export interface ModelCacheMetadataRepository {
@@ -96,6 +98,8 @@ export interface ModelCacheWriteOptions {
   assertCanCommit?: () => void;
   onVerifyProgress?: (hashedBytes: number, totalBytes: number) => void | Promise<void>;
   acquire?: (handle: FileSystemFileHandle, offset: number, checkpoint: (offset: number) => Promise<void>) => Promise<void>;
+  onQuotaFailure?: (neededBytes: number) => Promise<number>;
+  onPartialEvicted?: () => void | Promise<void>;
 }
 
 export interface ModelCacheBlobBackend {

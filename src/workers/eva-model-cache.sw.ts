@@ -2,6 +2,7 @@
 
 import { ModelIntegrityError, verifyBlobIntegrity } from '../lib/eva/model-cache/integrity';
 import { acquireModelChunks, RangeUnavailableError } from '../lib/eva/model-cache/acquisition';
+import { acquireWithRetry, acquisitionNetworkOperation, isAcquisitionNetworkError, AcquisitionNetworkError, DESKTOP_CHUNK_BYTES } from '../lib/eva/model-cache/resilience';
 import { writeOpfsStream } from '../lib/eva/model-cache/opfs-files';
 import { parseModelCacheManifestBytes } from '../lib/eva/model-cache/manifest';
 import {
@@ -120,11 +121,14 @@ class AsyncSemaphore {
 const configuredRoots = new Map<string, ConfiguredRoot>();
 const selectedVersions = new Map<string, string>();
 const loadLeases = new Map<string, ModelCacheLoadLease>();
+const leaseFailures = new Map<string, Map<string, unknown>>();
 const artifactAcquisitions = new Map<string, ArtifactAcquisition>();
 const transferSemaphore = new AsyncSemaphore(MAX_ARTIFACT_TRANSFERS);
 let storePromise: Promise<ModelCacheStore | null> | null = null;
 let developmentBackend: 'auto' | 'opfs' | 'none' = 'auto';
 let developmentFailNextWriteWithQuota = false;
+let developmentQuotaAfterOffset = 0;
+let developmentStateReset: Promise<void> | null = null;
 
 function modelRootKey(modelOrigin: string, modelRootPath: string): string {
   return JSON.stringify([modelOrigin, modelRootPath]);
@@ -193,6 +197,25 @@ async function handleDevelopmentFault(event: ExtendableMessageEvent, client: Cli
   }
   if (message.action === 'fail-next-write-quota') {
     developmentFailNextWriteWithQuota = true;
+    developmentQuotaAfterOffset = typeof message.afterOffset === 'number' && Number.isSafeInteger(message.afterOffset)
+      ? Math.max(0, message.afterOffset) : 0;
+    postRpcResponse(event, client, { ok: true });
+    return true;
+  }
+  if (message.action === 'restart-sw-state') {
+    // DEV only: mimic loss of the global, not deletion of durable bytes/metadata.
+    const pending = [...artifactAcquisitions.values()].map((entry) => entry.promise);
+    abortArtifactAcquisitions(() => true, 'Injected cache service restart.');
+    configuredRoots.clear(); selectedVersions.clear(); loadLeases.clear(); leaseFailures.clear();
+    const previousStore = storePromise;
+    developmentStateReset = (async () => {
+      await Promise.allSettled(pending);
+      (await previousStore)?.close();
+      storePromise = null;
+      artifactAcquisitions.clear();
+    })();
+    await developmentStateReset;
+    developmentStateReset = null;
     postRpcResponse(event, client, { ok: true });
     return true;
   }
@@ -256,9 +279,11 @@ function pruneExpiredLeases(now = Date.now()): void {
       void getStore().then((store) => store?.endVerificationScope(nonce));
     }
   }
+  for (const nonce of leaseFailures.keys()) if (!loadLeases.has(nonce)) leaseFailures.delete(nonce);
 }
 
 function releaseLeaseFromArtifactAcquisitions(nonce: string, reason: string): void {
+  leaseFailures.delete(nonce);
   for (const acquisition of artifactAcquisitions.values()) {
     if (acquisition.leaseNonces.delete(nonce)
       && acquisition.leaseNonces.size === 0
@@ -649,6 +674,7 @@ async function handleClientMessage(event: ExtendableMessageEvent): Promise<void>
   if (!client) {
     return;
   }
+  if (developmentStateReset) await developmentStateReset;
   if (__EVA_MODEL_CACHE_DEV__ && await handleDevelopmentFault(event, client)) {
     return;
   }
@@ -752,6 +778,7 @@ async function handleClientMessage(event: ExtendableMessageEvent): Promise<void>
       }
     }
     const lease = createModelCacheLoadLease(message, client.id, Date.now());
+    lease.chunkBytes = message.chunkBytes;
     if (loadLeases.size === 0) transferSemaphore.setLimit(message.concurrency ?? 2);
     loadLeases.set(lease.nonce, lease);
     await replyStatus(event, client, message, root);
@@ -1036,7 +1063,7 @@ function withDownloadProgress(
     async pull(controller) {
       try {
         liveAcquisitionLeases(acquisition);
-        const result = await reader.read();
+        const result = await acquisitionNetworkOperation(() => reader.read());
         const activeLeases = liveAcquisitionLeases(acquisition);
         if (result.done) {
           if (loaded !== file.bytes) {
@@ -1096,7 +1123,7 @@ async function fetchFullArtifact(
   file: ModelCachePresentManifestFile,
   acquisition: ArtifactAcquisitionContext,
 ): Promise<Response> {
-  const response = await fetch(url, {
+  const response = await acquisitionNetworkOperation(() => fetch(url, {
     method: 'GET',
     mode: 'cors',
     credentials: 'omit',
@@ -1104,8 +1131,12 @@ async function fetchFullArtifact(
     cache: 'no-store',
     signal: acquisition.controller.signal,
     headers: { Accept: file.contentType },
-  });
+  }));
   const check = checkModelCacheNetworkResponse(response, url);
+  if (response.status >= 500 && response.status <= 599) {
+    await response.body?.cancel();
+    throw new AcquisitionNetworkError('Model download service temporarily unavailable.');
+  }
   if (!check.ok || response.status !== 200 || !response.body) {
     throw new Error(`Eva model file ${file.path} returned an unusable response.`);
   }
@@ -1275,6 +1306,9 @@ async function acquireArtifact(
     inventory.manifestIdentity.manifestVersion,
     file.path,
   ]);
+  // Loader-internal retries cannot reset a shard's exhausted retry budget or
+  // retry failed integrity. Only a new explicit lease can attempt it again.
+  if (leaseFailures.get(lease.nonce)?.has(acquisitionKey)) throw leaseFailures.get(lease.nonce)!.get(acquisitionKey);
   const existing = artifactAcquisitions.get(acquisitionKey);
   if (existing && !existing.controller.signal.aborted) {
     existing.leaseNonces.add(lease.nonce);
@@ -1315,11 +1349,29 @@ async function acquireArtifact(
         source: 'network',
       };
     }
-    try {
+    let durableOffset = 0;
+    let quotaRecovered = false;
+    const chunked = file.bytes >= 64 * 1024;
+    const fallback = async (): Promise<ArtifactResult> => {
       requireLiveAcquisitionLease(acquisitionContext);
-      const chunked = file.bytes >= 64 * 1024;
+      const blob = await verifiedNetworkBlob(matched.route.url, file, acquisitionContext);
+      try {
+        await store.putFile(descriptor, file.path, blob, {
+          assertCanCommit: () => requireLiveAcquisitionLease(acquisitionContext),
+          onVerifyProgress: (bytes) => reportHashProgress(file, acquisitionContext, bytes),
+        });
+        requireLiveAcquisitionLease(acquisitionContext);
+        return { blob: await store.readFile(descriptor, file.path) ?? blob, source: 'network' };
+      } catch (error) {
+        requireLiveAcquisitionLease(acquisitionContext);
+        if (error instanceof ModelIntegrityError) throw error;
+        return { blob, source: 'network' };
+      }
+    };
+    const attempt = async (): Promise<ArtifactResult> => {
+      requireLiveAcquisitionLease(acquisitionContext);
       const response = chunked ? null : await fetchFullArtifact(matched.route.url, file, acquisitionContext);
-      if (__EVA_MODEL_CACHE_DEV__ && developmentFailNextWriteWithQuota) {
+      if (__EVA_MODEL_CACHE_DEV__ && developmentFailNextWriteWithQuota && !developmentQuotaAfterOffset) {
         developmentFailNextWriteWithQuota = false;
         await response?.body?.cancel('Injected model-cache quota failure.').catch(() => undefined);
         throw new DOMException('Injected model-cache quota failure.', 'QuotaExceededError');
@@ -1327,11 +1379,24 @@ async function acquireArtifact(
       const stored = await store.putFile(descriptor, file.path, response?.body ?? new Blob(), {
         assertCanCommit: () => requireLiveAcquisitionLease(acquisitionContext),
         onVerifyProgress: (bytes) => reportHashProgress(file, acquisitionContext, bytes),
+        onQuotaFailure: async (needed) => {
+          const freed = await store.evictOwned(needed, pinnedPackageKeys(descriptor)).catch(() => 0);
+          quotaRecovered = freed >= needed;
+          return freed;
+        },
+        onPartialEvicted: () => broadcastWarning(matched.root, activeLease.manifestVersion, {
+          code: 'browser-evicted', recoverable: true,
+          message: 'Browser cleared partial download; resuming what survived.',
+        }),
         acquire: chunked ? async (handle, offset, checkpoint) => {
+          durableOffset = offset;
           let lastReport = 0;
           try {
             await acquireModelChunks(handle, offset, {
-              total: file.bytes, signal: acquisitionContext.controller.signal, checkpoint,
+              total: file.bytes, signal: acquisitionContext.controller.signal,
+              // Small deterministic fixtures keep their eight-chunk cadence.
+              chunkBytes: Math.min(activeLease.chunkBytes ?? DESKTOP_CHUNK_BYTES, Math.max(16 * 1024, Math.ceil(file.bytes / 8))),
+              checkpoint: async (completed) => { await checkpoint(completed); durableOffset = completed; },
               fetch: async (start, end) => {
                 requireLiveAcquisitionLease(acquisitionContext);
                 const result = await fetch(matched.route.url, { mode: 'cors', credentials: 'omit', redirect: 'error', cache: 'no-store',
@@ -1343,6 +1408,13 @@ async function acquireArtifact(
                 return result;
               },
               progress: async (received, durable) => {
+                if (__EVA_MODEL_CACHE_DEV__ && developmentFailNextWriteWithQuota && developmentQuotaAfterOffset > 0
+                  && durable >= developmentQuotaAfterOffset && received > durable) {
+                  developmentFailNextWriteWithQuota = false;
+                  // Throw after a write in the NEXT chunk, before its close or
+                  // checkpoint. Exercises reader cancellation and writer abort.
+                  throw new DOMException('Injected mid-chunk quota failure.', 'QuotaExceededError');
+                }
                 const leases = liveAcquisitionLeases(acquisitionContext);
                 const now = Date.now();
                 for (const lease of leases) lease.lastActivityAt = now;
@@ -1359,7 +1431,7 @@ async function acquireArtifact(
           } catch (error) {
             if (!(error instanceof RangeUnavailableError)) throw error;
             requireLiveAcquisitionLease(acquisitionContext);
-            await broadcastWarning(matched.root, activeLease.manifestVersion, { code: 'network-only', recoverable: true,
+            await broadcastWarning(matched.root, activeLease.manifestVersion, { code: 'host-contract', recoverable: true,
               message: 'The model host does not return valid byte ranges. Using a full-file verified download; pausing this file will restart it. SHA-256 verification remains required.' });
             const full = await fetchFullArtifact(matched.route.url, file, acquisitionContext);
             await writeOpfsStream(handle, full.body!);
@@ -1373,6 +1445,22 @@ async function acquireArtifact(
         throw new Error('The committed Eva model file could not be reopened.');
       }
       return { blob, source: 'network' };
+    };
+    try {
+      return await acquireWithRetry({
+        signal: controller.signal, attempt, fallback,
+        retrying: async (attempt) => {
+          for (const lease of liveAcquisitionLeases(acquisitionContext)) {
+            lease.lastActivityAt = Date.now();
+            await postLeaseMessage(lease, (clientId) => ({
+              ...workerMessageBase(clientId, lease, lease.manifestVersion), type: 'FILE_PROGRESS',
+              file: file.path, source: 'network', phase: 'retrying', attempt,
+              loadedBytes: durableOffset, receivedBytes: durableOffset, verifiedBytes: 0, totalBytes: file.bytes,
+              transfer: { durableBytes: durableOffset, networkBytes: 0, resumedBytes: durableOffset },
+            }));
+          }
+        },
+      });
     } catch (error) {
       activeLease = requireLiveAcquisitionLease(acquisitionContext);
       if (error instanceof ModelIntegrityError || controller.signal.aborted) {
@@ -1380,30 +1468,40 @@ async function acquireArtifact(
       }
       if (isQuotaError(error)) {
         await reportAcquisitionSourceChange(acquisitionContext, 'quota');
+        // One storage-specific retry, separate from network backoff. Re-entry
+        // reads the same checkpoint only when eviction freed the required bytes.
+        if (quotaRecovered) return attempt();
         await store.evictOwned(file.bytes, pinnedPackageKeys(descriptor)).catch(() => 0);
+      } else if (isAcquisitionNetworkError(error)) {
+        await broadcastWarning(matched.root, activeLease.manifestVersion, {
+          code: 'connection-lost', message: 'The connection dropped. Resume continues from durable checkpoints.', recoverable: true,
+        });
+        throw error;
       } else {
         await reportAcquisitionSourceChange(acquisitionContext, 'storage-unavailable');
+        throw error;
       }
-
-      requireLiveAcquisitionLease(acquisitionContext);
-      const blob = await verifiedNetworkBlob(matched.route.url, file, acquisitionContext);
-      try {
-        requireLiveAcquisitionLease(acquisitionContext);
-        await store.putFile(descriptor, file.path, blob, {
-          assertCanCommit: () => requireLiveAcquisitionLease(acquisitionContext),
-          onVerifyProgress: (bytes) => reportHashProgress(file, acquisitionContext, bytes),
-        });
-        requireLiveAcquisitionLease(acquisitionContext);
-        const reopened = await store.readFile(descriptor, file.path);
-        return { blob: reopened ?? blob, source: 'network' };
-      } catch {
-        requireLiveAcquisitionLease(acquisitionContext);
-        return { blob, source: 'network' };
-      }
+      return fallback();
     }
   }).then(async (result) => {
     await reportHashProgress(file, acquisitionContext, file.bytes, true);
     return result;
+  }).catch(async (error: unknown) => {
+    if (!controller.signal.aborted) {
+      for (const nonce of acquisitionContext.leaseNonces) {
+        const failures = leaseFailures.get(nonce) ?? new Map<string, unknown>();
+        failures.set(acquisitionKey, error); leaseFailures.set(nonce, failures);
+      }
+      if (error instanceof ModelIntegrityError) {
+        for (const lease of liveAcquisitionLeases(acquisitionContext)) {
+          await postLeaseMessage(lease, clientId => ({
+            ...workerMessageBase(clientId, lease, lease.manifestVersion), type: 'CACHE_WARNING',
+            warning: { code: 'integrity-failed', message: 'Downloaded model data failed integrity verification. No model was loaded.', recoverable: false },
+          }));
+        }
+      }
+    }
+    throw error;
   }).finally(() => {
     if (artifactAcquisitions.get(acquisitionKey)?.promise === acquisition) {
       artifactAcquisitions.delete(acquisitionKey);

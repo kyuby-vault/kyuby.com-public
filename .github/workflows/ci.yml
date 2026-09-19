@@ -37,7 +37,7 @@ jobs:
           path: ${{ runner.temp }}/kyuby-devpod-build-cache
           key: ${{ runner.os }}-devpod-${{ hashFiles('Containerfile', 'package-lock.json', '.github/workflows/devpod/**') }}
           restore-keys: ${{ runner.os }}-devpod-
-      - name: Build the digest-pinned DevPod with layer caching and smoke assertions
+      - name: Build the Node 22 DevPod with layer caching and smoke assertions
         run: bash .github/workflows/devpod/ci-image.sh
       - name: Container gates (private full suite; public curated build gates)
         run: node .github/workflows/devpod/invoke.mjs gates
@@ -70,7 +70,7 @@ jobs:
           path: ${{ runner.temp }}/kyuby-devpod-build-cache
           key: ${{ runner.os }}-devpod-${{ hashFiles('Containerfile', 'package-lock.json', '.github/workflows/devpod/**') }}
           restore-keys: ${{ runner.os }}-devpod-
-      - name: Build the digest-pinned DevPod with layer caching and smoke assertions
+      - name: Build the Node 22 DevPod with layer caching and smoke assertions
         run: bash .github/workflows/devpod/ci-image.sh
       - name: Container gates (private full suite; public curated build gates)
         run: node .github/workflows/devpod/invoke.mjs gates

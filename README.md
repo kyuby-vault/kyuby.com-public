@@ -4,7 +4,7 @@ This is the public distribution mirror of the private kyuby.com project. It cont
 
 ## Build
 
-Use Node.js 22.23.2:
+Use Node.js 22.x (`.nvmrc` pins the major, not a patch):
 
 ```sh
 npm ci
@@ -17,7 +17,7 @@ The production service-worker integration is included because it is required by 
 
 ## Releases
 
-Snapshots sync directly to public `main` from clean private `main`, after matching freshly fetched `origin/main` and verifying successful private CI run, check-suite, and `gates` results for that exact commit. Private PRs and branch protection are not export prerequisites under the 2026-09-16 trunk-based owner decision. The full unit and browser suites also run locally before export. There is no second public pull request or merge. The public `gates` job validates installation, static checks, build, and deployment dry-run; it does not claim to run the private tests. Preview URLs are reported in the Actions job summary. Production requires a separate manual workflow dispatch and environment approval.
+Snapshots sync directly to public `main` from clean private `main`, after matching freshly fetched `origin/main` and verifying successful private CI run, check-suite, and `gates` results for that exact commit. Private PRs and branch protection are not export prerequisites under the 2026-09-16 trunk-based owner decision. The full unit and browser suites also run in the local DevPod before export, without duplicate host validation. There is no second public pull request or merge. The public `gates` job validates installation, static checks, build, and deployment dry-run; it does not claim to run the private tests. Preview URLs are reported in the Actions job summary. Production requires a separate manual workflow dispatch and environment approval.
 
 Changes should be proposed to the maintainers for inclusion upstream. Public snapshot history is independent of private history. Metadata identifies the vetted upstream commit and its source tree; only allowlisted files are distributed, never private Git history or uncommitted changes.
 

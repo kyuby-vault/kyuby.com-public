@@ -7,6 +7,7 @@ import type {
 } from './types';
 import {
   MODEL_CACHE_PROTOCOL_VERSION,
+  MODEL_CACHE_LOAD_LEASE_ABSOLUTE_MS,
   isModelCacheWorkerMessage,
   type ModelCacheClientMessage,
   type ModelCacheWorkerMessage,
@@ -19,6 +20,10 @@ const SERVICE_WORKER_SCOPE = '/';
 const SERVICE_WORKER_READY_TIMEOUT_MS = 10_000;
 const RPC_TIMEOUT_MS = 10_000;
 const REMOVE_MODEL_RPC_TIMEOUT_MS = 10 * 60 * 1_000;
+
+export class ModelCacheRpcError extends Error {
+  constructor(readonly code: Extract<ModelCacheWorkerMessage, { type: 'ERROR' }>['code'], message: string) { super(message); }
+}
 
 export interface ModelCacheRoot {
   modelOrigin: string;
@@ -114,6 +119,11 @@ export class EvaModelCacheClient extends EventTarget {
   #initializePromise: Promise<ModelCacheClientAvailability> | null = null;
   #root: ModelCacheRoot | null = null;
   #manifestVersion: string | null = null;
+  #inventory: ModelCacheInventory | null = null;
+  #activeLoad: Extract<ModelCacheClientMessage, { type: 'BEGIN_LOAD' | 'BEGIN_DISK_LOAD' }> | null = null;
+  #leaseStartedAt = 0;
+  #recovering: Promise<void> | null = null;
+  #restarts = 0;
   #pending = new Map<string, PendingRpc>();
   #listeners = new Set<ModelCacheMessageListener>();
 
@@ -124,6 +134,8 @@ export class EvaModelCacheClient extends EventTarget {
   get controller(): ServiceWorker | null {
     return this.#controller;
   }
+
+  get restarts(): number { return this.#restarts; }
 
   initialize(): Promise<ModelCacheClientAvailability> {
     this.#initializePromise ??= this.#initialize();
@@ -138,6 +150,7 @@ export class EvaModelCacheClient extends EventTarget {
   async configureRoot(root: ModelCacheRoot): Promise<ModelCacheStatus> {
     this.#root = root;
     this.#manifestVersion = null;
+    this.#inventory = null;
     const response = await this.#rpc({
       ...this.#baseMessage(null),
       type: 'CONFIGURE',
@@ -147,6 +160,13 @@ export class EvaModelCacheClient extends EventTarget {
   }
 
   async configureInventory(inventory: ModelCacheInventory): Promise<ModelCacheStatus> {
+    return this.ensureConfigured(inventory);
+  }
+
+  /** Re-send every time: a live page can outlast a Service Worker's globals. */
+  async ensureConfigured(inventory = this.#inventory): Promise<ModelCacheStatus> {
+    if (!inventory) throw new Error('No validated model inventory is available.');
+    this.#inventory = inventory;
     this.#root = {
       modelOrigin: inventory.modelOrigin,
       modelRootPath: inventory.modelRootPath,
@@ -168,14 +188,18 @@ export class EvaModelCacheClient extends EventTarget {
     return response.status;
   }
 
-  async beginLoad(diskOnly = false, concurrency: 2 | 4 = 2): Promise<string> {
+  async beginLoad(diskOnly = false, concurrency: 2 | 4 = 2, chunkBytes?: number): Promise<string> {
     const nonce = crypto.randomUUID();
-    await this.#rpc({
+    const message: Extract<ModelCacheClientMessage, { type: 'BEGIN_LOAD' | 'BEGIN_DISK_LOAD' }> = {
       ...this.#baseMessage(this.#requireManifestVersion()),
       type: diskOnly ? 'BEGIN_DISK_LOAD' : 'BEGIN_LOAD',
       nonce,
       concurrency,
-    }, 'STATUS');
+      ...(chunkBytes ? { chunkBytes } : {}),
+    };
+    await this.#rpc(message, 'STATUS');
+    this.#activeLoad = message;
+    this.#leaseStartedAt = Date.now();
     return nonce;
   }
 
@@ -185,10 +209,14 @@ export class EvaModelCacheClient extends EventTarget {
       type: 'END_LOAD',
       nonce,
     }, 'STATUS');
+    this.#activeLoad = null;
     return response.status;
   }
 
   async renewLoad(nonce: string): Promise<ModelCacheStatus> {
+    if (this.#activeLoad && Date.now() - this.#leaseStartedAt >= MODEL_CACHE_LOAD_LEASE_ABSOLUTE_MS) {
+      throw new ModelCacheRpcError('LEASE_REJECTED', 'The explicit load lease expired.');
+    }
     const response = await this.#rpc({
       ...this.#baseMessage(this.#requireManifestVersion()),
       type: 'RENEW_LOAD',
@@ -203,6 +231,7 @@ export class EvaModelCacheClient extends EventTarget {
       type: 'CANCEL_LOAD',
       nonce,
     }, 'STATUS');
+    this.#activeLoad = null;
     return response.status;
   }
 
@@ -220,6 +249,7 @@ export class EvaModelCacheClient extends EventTarget {
   }
 
   dispose(): void {
+    this.#activeLoad = null;
     navigator.serviceWorker?.removeEventListener('message', this.#handleServiceWorkerMessage);
     for (const pending of this.#pending.values()) {
       globalThis.clearTimeout(pending.timeout);
@@ -287,11 +317,37 @@ export class EvaModelCacheClient extends EventTarget {
     return this.#manifestVersion;
   }
 
-  #rpc<T extends ModelCacheWorkerMessage['type']>(
+  async #rpc<T extends ModelCacheWorkerMessage['type']>(
+    message: ModelCacheClientMessage, expectedType: T, timeoutMs = RPC_TIMEOUT_MS,
+  ): Promise<Extract<ModelCacheWorkerMessage, { type: T }>> {
+    try { return await this.#send(message, expectedType, timeoutMs); }
+    catch (error) {
+      if (message.type === 'CONFIGURE' || !(error instanceof ModelCacheRpcError)
+        || !['NOT_CONFIGURED', 'LEASE_REJECTED'].includes(error.code) || !this.#inventory) throw error;
+      // Exactly one replay. CONFIGURE and the replay bypass this recovery wrapper.
+      this.#recovering ??= (async () => {
+        await this.ensureConfigured();
+        if (this.#activeLoad && message.type !== 'BEGIN_LOAD' && message.type !== 'BEGIN_DISK_LOAD') {
+          if (Date.now() - this.#leaseStartedAt >= MODEL_CACHE_LOAD_LEASE_ABSOLUTE_MS) throw error;
+          // Restore only this page's still-explicit lease; this does not fetch bytes.
+          await this.#send({ ...this.#activeLoad, requestId: crypto.randomUUID() }, 'STATUS');
+        }
+        this.#restarts++;
+        this.#handleIncomingMessage({ ...this.#baseMessage(message.manifestVersion),
+          type: 'CACHE_WARNING', clientId: 'page-recovery',
+          warning: { code: 'cache-service-restarted', message: 'The local cache service restarted; continuing.', recoverable: true } });
+      })().finally(() => { this.#recovering = null; });
+      await this.#recovering;
+      return this.#send({ ...message, requestId: crypto.randomUUID() }, expectedType, timeoutMs);
+    }
+  }
+
+  #send<T extends ModelCacheWorkerMessage['type']>(
     message: ModelCacheClientMessage,
     expectedType: T,
     timeoutMs = RPC_TIMEOUT_MS,
   ): Promise<Extract<ModelCacheWorkerMessage, { type: T }>> {
+    this.#controller = navigator.serviceWorker?.controller ?? this.#controller;
     if (!this.#controller) {
       return Promise.reject(new Error('Eva model cache Service Worker is not controlling this page.'));
     }
@@ -340,6 +396,10 @@ export class EvaModelCacheClient extends EventTarget {
       return;
     }
 
+    if (value.type === 'ERROR') {
+      this.#settleRpcError(value.requestId, new ModelCacheRpcError(value.code, value.message));
+      return;
+    }
     for (const listener of this.#listeners) {
       listener(value);
     }
@@ -347,10 +407,6 @@ export class EvaModelCacheClient extends EventTarget {
 
     const pending = this.#pending.get(value.requestId);
     if (!pending) {
-      return;
-    }
-    if (value.type === 'ERROR') {
-      this.#settleRpcError(value.requestId, new Error(value.message));
       return;
     }
     if (value.type !== pending.expectedType) {

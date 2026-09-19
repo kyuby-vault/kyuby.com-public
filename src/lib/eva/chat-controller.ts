@@ -76,6 +76,7 @@ import {
 } from './model-context';
 import {
   EvaModelCacheClient,
+  ModelCacheRpcError,
   inspectBrowserStorage,
   requestBrowserStoragePersistence,
   type BrowserStorageStatus,
@@ -92,6 +93,9 @@ import type {
 } from './model-cache/types';
 import { createModelCacheRootPath } from './model-cache/routing';
 import { ModelCacheProgress } from './model-cache/progress';
+import { AcquisitionWakeLock } from './model-cache/wake-lock';
+import { ACQUISITION_NOTICES, acquisitionCapacity, acquisitionDevicePolicy, acquisitionFailureCode, terminateFailedLoad,
+  type AcquisitionCapacity, type AcquisitionNoticeCode } from './model-cache/resilience';
 import {
   INITIAL_MODEL_CACHE_UI_STATE,
   MODEL_CACHE_CORRUPTION_WARNING,
@@ -580,6 +584,31 @@ export async function mountEvaChat(): Promise<void> {
   let reverifying = false;
   let autoResuming = false;
   let cacheProgress = new ModelCacheProgress(null);
+  let capacity: AcquisitionCapacity = 'ok';
+  let acquisitionFailure: AcquisitionNoticeCode | null = null;
+  let runtimeRetryNeeded = false;
+  const capacityLabel = requiredElement<HTMLElement>('acquisition-capacity');
+  const visibilityHint = requiredElement<HTMLElement>('download-visibility-hint');
+  const devicePolicy = () => acquisitionDevicePolicy(navigator as Navigator & {
+    userAgentData?: { mobile?: boolean }; deviceMemory?: number;
+  }, downloadConcurrency.value === '4' ? 4 : 2);
+  const acquisitionWakeLock = new AcquisitionWakeLock(() => {
+    if (devicePolicy().mobile) {
+      visibilityHint.hidden = false;
+      visibilityHint.textContent = 'Screen wake lock is unavailable. Keep this tab visible while downloading; you can resume after an interruption.';
+    }
+  });
+
+  function acquisitionNotice(code: AcquisitionNoticeCode): void {
+    runtimeNotice.dataset.acquisition = code;
+    runtimeNoticeText.textContent = ACQUISITION_NOTICES[code];
+  }
+
+  function acquisitionDiagnostic(error: unknown): void {
+    const text = error instanceof Error ? error.message : String(error);
+    liveStatus.textContent = text.slice(0, 2048);
+    console.warn('Eva acquisition diagnostic:', text.slice(0, 2048));
+  }
 
   function activeSessionStorageKey(): string {
     return `${ACTIVE_SESSION_KEY}:${JSON.stringify(contextScope)}`;
@@ -709,9 +738,10 @@ export async function mountEvaChat(): Promise<void> {
           if (cacheLeaseHeartbeatNonce !== nonce) {
             return;
           }
+          acquisitionDiagnostic(error);
           const warning: ModelCacheWarning = {
             code: 'protocol',
-            message: `Eva's model-cache lease could not be renewed: ${error instanceof Error ? error.message : String(error)}`,
+            message: ACQUISITION_NOTICES['cache-unavailable'],
             recoverable: true,
           };
           runtimeNoticeText.textContent = warning.message;
@@ -853,7 +883,9 @@ export async function mountEvaChat(): Promise<void> {
     const cacheBusy = uiState.cacheAction !== 'idle';
     const busy = sessionBusy || cacheBusy || generating || contextBusy || reverifying || autoResuming;
     const ready = uiState.session === 'ready';
-    loadButton.disabled = !modelConfig || derived.load.disabled || contextBusy || reverifying || autoResuming;
+    loadButton.disabled = !modelConfig || derived.load.disabled || contextBusy || reverifying || autoResuming || capacity === 'insufficient';
+    retryRuntimeButton.hidden = !(derived.retryRuntime || runtimeRetryNeeded || capacity === 'insufficient');
+    retryRuntimeButton.disabled = busy;
     unloadButton.disabled = derived.unload.disabled || contextBusy || reverifying || autoResuming;
     autoResumeToggle.disabled = busy;
     input.disabled = !ready || busy;
@@ -1085,6 +1117,13 @@ export async function mountEvaChat(): Promise<void> {
 
   async function refreshStorageStatus(): Promise<void> {
     browserStorage = await inspectBrowserStorage();
+    capacity = acquisitionCapacity(cacheStatus?.totalBytes ?? modelConfig?.manifest.cacheInventory?.totalBytes ?? 0,
+      cacheStatus?.cachedBytes ?? 0, browserStorage.estimate);
+    capacityLabel.dataset.state = capacity;
+    capacityLabel.textContent = capacity === 'ok' ? 'OK · space available'
+      : capacity === 'tight' ? 'Tight · may need cleanup; the browser estimate is limited'
+        : 'Insufficient · free browser storage or remove an old cached model, then Retry';
+    if (capacity === 'insufficient' && uiState.session === 'unloaded') acquisitionNotice('insufficient-storage');
     renderUi();
   }
 
@@ -1125,7 +1164,7 @@ export async function mountEvaChat(): Promise<void> {
   }
 
   function handleCacheMessage(message: ModelCacheWorkerMessage): void {
-    if (autoResuming && (message.type === 'CACHE_WARNING' || message.type === 'ERROR')) return;
+    if (autoResuming && (message.type === 'CACHE_WARNING' && message.warning.code !== 'cache-service-restarted' || message.type === 'ERROR')) return;
     if (message.type === 'STATUS') {
       cacheStatus = message.status;
       browserStorage = {
@@ -1155,6 +1194,11 @@ export async function mountEvaChat(): Promise<void> {
         patchUiState({ cacheAction: 'verifying' });
       }
       if (!cacheProgress.update(message)) return;
+      if (message.phase === 'retrying') {
+        acquisitionNotice('connection-lost');
+        runtimeNoticeText.textContent = `Connection dropped — retrying (${message.attempt}/4). Resuming from the durable checkpoint.`;
+      } else if (message.phase === 'verifying') acquisitionNotice('verifying');
+      else if (message.transfer && message.transfer.resumedBytes > 0) acquisitionNotice('resuming');
       if (message.transfer) {
         downloadMetrics.set(message.file, message.transfer);
         const metrics = [...downloadMetrics.values()];
@@ -1176,7 +1220,7 @@ export async function mountEvaChat(): Promise<void> {
         item.textContent = `${file.file} · ${Math.floor(file.percent)}% · ${file.source} · ${file.phase} · received ${formatBytes(file.received)}, verified ${formatBytes(file.verified)} / ${formatBytes(file.total)}`;
         return item;
       }));
-      const phase = message.phase === 'downloading'
+      const phase = message.phase === 'retrying' ? `Retrying (${message.attempt}/4)` : message.phase === 'downloading'
         ? 'Downloading'
         : message.phase === 'verifying' ? 'Verifying'
           : message.phase === 'committing' ? 'Finalizing'
@@ -1213,12 +1257,22 @@ export async function mountEvaChat(): Promise<void> {
     }
 
     if (message.type === 'CACHE_WARNING') {
+      if (message.warning.code === 'connection-lost') acquisitionFailure = 'connection-lost';
+      if (message.warning.code === 'integrity-failed') acquisitionFailure = 'load-failed';
       if (message.warning.code === 'cache-corrupt') {
         runtimeNoticeText.textContent = 'Cached model data was invalid and was removed. Eva is loading from the network.';
+      } else if (message.warning.code === 'browser-evicted') {
+        acquisitionNotice('resuming');
+        runtimeNoticeText.textContent = 'Browser cleared partial download; resuming what survived.';
       } else {
-        runtimeNoticeText.textContent = message.warning.message;
+        const code: AcquisitionNoticeCode = message.warning.code === 'cache-service-restarted' ? 'cache-service-restarted'
+          : message.warning.code === 'host-contract' ? 'host-contract'
+          : message.warning.code === 'connection-lost' ? 'connection-lost'
+          : message.warning.code === 'integrity-failed' ? 'load-failed'
+          : message.warning.code === 'quota-insufficient' ? 'insufficient-storage' : 'cache-unavailable';
+        acquisitionNotice(code);
       }
-      dispatchUi({ type: 'WARNING_SET', warning: message.warning });
+      dispatchUi({ type: 'WARNING_SET', warning: { ...message.warning, message: runtimeNoticeText.textContent ?? '' } });
       if (message.warning.code === 'cache-corrupt'
         || message.warning.code === 'quota-insufficient'
         || message.warning.code === 'storage-unavailable') {
@@ -1246,9 +1300,10 @@ export async function mountEvaChat(): Promise<void> {
     }
 
     if (message.type === 'ERROR') {
+      acquisitionDiagnostic(message.message);
       const warning: ModelCacheWarning = {
         code: 'protocol',
-        message: message.message,
+        message: ACQUISITION_NOTICES['cache-unavailable'],
         recoverable: message.recoverable,
       };
       dispatchUi({ type: 'WARNING_SET', warning });
@@ -1303,6 +1358,7 @@ export async function mountEvaChat(): Promise<void> {
   }
 
   async function checkRuntime(): Promise<void> {
+    runtimeRetryNeeded = false;
     modelConfig = null;
     cacheConfigured = false;
     cacheStatus = null;
@@ -1345,7 +1401,8 @@ export async function mountEvaChat(): Promise<void> {
 
       if (!fixtureMode || fixtureMode === 'model-cache') {
         const availability = await cacheClient.initialize();
-        cacheWarning = availability.warning;
+        if (availability.warning) acquisitionDiagnostic(availability.warning.message);
+        cacheWarning = availability.warning ? { ...availability.warning, message: ACQUISITION_NOTICES['cache-unavailable'] } : null;
         if (availability.available) {
           try {
             cacheStatus = await cacheClient.configureRoot({
@@ -1353,9 +1410,10 @@ export async function mountEvaChat(): Promise<void> {
               modelRootPath: createModelCacheRootPath(settings.modelId),
             });
           } catch (error) {
+            acquisitionDiagnostic(error);
             cacheWarning = {
               code: 'network-only',
-              message: `Persistent model caching could not start: ${error instanceof Error ? error.message : String(error)}`,
+              message: ACQUISITION_NOTICES['cache-unavailable'],
               recoverable: true,
             };
           }
@@ -1390,10 +1448,11 @@ export async function mountEvaChat(): Promise<void> {
           residency = cacheStatus.residency;
           cacheWarning = cacheStatus.warning ?? cacheWarning;
         } catch (error) {
+          acquisitionDiagnostic(error);
           residency = 'network-only';
           cacheWarning = {
             code: 'network-only',
-            message: `Eva's model cache is unavailable: ${error instanceof Error ? error.message : String(error)}`,
+            message: ACQUISITION_NOTICES['cache-unavailable'],
             recoverable: true,
           };
         }
@@ -1428,14 +1487,18 @@ export async function mountEvaChat(): Promise<void> {
         liveStatus.textContent = `The debug session ID could not be updated: ${error instanceof Error ? error.message : String(error)}`;
       }
       dispatchUi({ type: 'PREFLIGHT_SUCCEEDED', residency });
+      if (!uiState.manifestUpdateAvailable && (cacheWarning?.code === 'network-only' || cacheStatus?.backend === 'unavailable')) acquisitionNotice('cache-unavailable');
+      await refreshStorageStatus();
+      if (capacity === 'tight' && residency !== 'on-disk') runtimeNoticeText.textContent += ' Storage is tight or its estimate unavailable; cleanup may be needed.';
     } catch (error) {
       modelLabel.textContent = 'Eva artifact preflight failed';
-      runtimeNoticeText.textContent = `Eva artifact preflight failed: ${error instanceof Error ? error.message : String(error)} No model was loaded.`;
+      acquisitionDiagnostic(error);
+      acquisitionNotice('load-failed');
       retryRuntimeButton.hidden = false;
       dispatchUi({ type: 'RESIDENCY_CHANGED', residency: 'network-only' });
       dispatchUi({
         type: 'PREFLIGHT_FAILED',
-        error: error instanceof Error ? error.message : String(error),
+        error: ACQUISITION_NOTICES['load-failed'],
       });
     }
   }
@@ -1495,6 +1558,9 @@ export async function mountEvaChat(): Promise<void> {
     }
     const initialSource: ModelCacheLoadSource = uiState.residency === 'on-disk' ? 'disk' : 'network';
     downloadPaused = false;
+    acquisitionFailure = null;
+    runtimeRetryNeeded = false;
+    visibilityHint.hidden = true;
     downloadStartedAt = performance.now();
     downloadMetrics.clear();
     downloadStatus.textContent = 'Preparing explicit load; speed and download ETA will appear for Range transfers.';
@@ -1514,52 +1580,87 @@ export async function mountEvaChat(): Promise<void> {
     dispatchUi({ type: 'LOAD_STARTED', source: initialSource });
 
     try {
+      await refreshStorageStatus();
+      if (!diskOnly && capacity === 'insufficient') throw new DOMException('Insufficient acquisition storage.', 'QuotaExceededError');
+      if (cacheClient.availability.available && modelConfig.manifest.cacheInventory && !cacheConfigured) {
+        cacheStatus = await cacheClient.ensureConfigured();
+        cacheConfigured = true;
+      }
       if (diskOnly && !cacheConfigured) throw new Error('Disk-only loading requires the verified local cache.');
       if (cacheConfigured) {
         try {
-          cacheLoadNonce = await cacheClient.beginLoad(diskOnly, downloadConcurrency.value === '4' ? 4 : 2);
+          const policy = devicePolicy();
+          try { cacheLoadNonce = await cacheClient.beginLoad(diskOnly, policy.concurrency, policy.chunkBytes); }
+          catch (error) {
+            // RPC-coded failures already consumed their one self-heal replay.
+            // Transport/timeouts get one explicit configure + begin attempt here.
+            if (error instanceof ModelCacheRpcError) throw error;
+            await cacheClient.ensureConfigured();
+            cacheLoadNonce = await cacheClient.beginLoad(diskOnly, policy.concurrency, policy.chunkBytes);
+          }
           startCacheLeaseHeartbeat(cacheLoadNonce);
           updateControls();
         } catch (error) {
-          if (diskOnly) throw error;
-          const warning: ModelCacheWarning = {
-            code: 'network-only',
-            message: `This load cannot be cached: ${error instanceof Error ? error.message : String(error)}`,
-            recoverable: true,
-          };
-          runtimeNoticeText.textContent = `${warning.message} Eva is loading from the network.`;
-          dispatchUi({
-            type: 'LOAD_SOURCE_CHANGED',
-            source: 'network',
-            warning,
-          });
+          acquisitionDiagnostic(error);
+          acquisitionFailure = 'cache-unavailable';
+          // A rejected lease must NEVER turn into an uncontrolled multi-GB fetch.
+          // Retry/Load re-drives the same recovery, including disk-only loads.
+          throw error;
         }
       }
+      if (devicePolicy().mobile && (!cacheLoadNonce || cacheStatus?.backend === 'unavailable')) {
+        acquisitionFailure = 'cache-unavailable';
+        throw new Error('Mobile acquisition needs a working local cache. Enable browser storage, then Retry.');
+      }
+      if (!cacheConfigured && !diskOnly) {
+        const warning: ModelCacheWarning = {
+          code: 'network-only',
+          message: ACQUISITION_NOTICES['cache-unavailable'],
+          recoverable: true,
+        };
+        runtimeNoticeText.textContent = `${warning.message} Eva is loading from the network.`;
+        dispatchUi({ type: 'LOAD_SOURCE_CHANGED', source: 'network', warning });
+      }
+      if (cacheLoadNonce && initialSource === 'network') await acquisitionWakeLock.start();
 
       // The explicit page lease must exist before the dedicated worker script is
       // requested, allowing the Service Worker to bind its resulting Client id.
-      runtime ??= fixtureMode === 'ready' ? new FixtureRuntime() : new EvaWorkerClient();
-
       const loadConfig: EvaModelConfig = {
         ...modelConfig,
         cacheLeaseNonce: cacheLoadNonce,
         pageHeapHeadroom: heapHeadroom(),
         kvAllowance: kvAllowance.value as EvaKvAllowance,
       };
-      await runtime.load(loadConfig, (progress) => {
-        if (cacheConfigured && modelConfig?.manifest.cacheInventory) return; // SW owns aggregate progress.
-        const percent = progress.progress ?? (
-          progress.loaded !== null && progress.total ? progress.loaded / progress.total * 100 : 0
-        );
-        const boundedPercent = Math.max(loadProgressBar.value, Math.min(100, Math.round(percent)));
-        loadProgressBar.value = boundedPercent;
-        loadProgressBar.textContent = `${boundedPercent}%`;
-        loadProgressValue.textContent = `${boundedPercent}%`;
-        const source = uiState.loadSource === 'disk' ? 'Disk' : 'Network';
-        loadProgressLabel.textContent = progress.file
-          ? `Loading ${progress.file.split('/').at(-1)} · ${source}`
-          : `${progress.status} · ${source}`;
-      });
+      const performLoad = async () => {
+        if (downloadPaused || disposed) throw new DOMException('Acquisition ended.', 'AbortError');
+        runtime ??= fixtureMode === 'ready' ? new FixtureRuntime() : new EvaWorkerClient();
+        await runtime.load(loadConfig, (progress) => {
+          if (cacheConfigured && modelConfig?.manifest.cacheInventory) return; // SW owns aggregate progress.
+          const percent = progress.progress ?? (
+            progress.loaded !== null && progress.total ? progress.loaded / progress.total * 100 : 0
+          );
+          const boundedPercent = Math.max(loadProgressBar.value, Math.min(100, Math.round(percent)));
+          loadProgressBar.value = boundedPercent;
+          loadProgressBar.textContent = `${boundedPercent}%`;
+          loadProgressValue.textContent = `${boundedPercent}%`;
+          const source = uiState.loadSource === 'disk' ? 'Disk' : 'Network';
+          loadProgressLabel.textContent = progress.file
+            ? `Loading ${progress.file.split('/').at(-1)} · ${source}`
+            : `${progress.status} · ${source}`;
+        });
+      };
+      const beforeLoadRestarts = cacheClient.restarts;
+      try { await performLoad(); }
+      catch (error) {
+        runtime = terminateFailedLoad(runtime);
+        if (!cacheLoadNonce || downloadPaused || disposed || acquisitionFailure === 'load-failed') throw error;
+        // A killed SW also breaks the in-flight Fetch, not just the next RPC.
+        // Reconcile the existing explicit lease; retry inference setup ONCE only
+        // if a lost global was actually recovered, never for integrity failures.
+        await cacheClient.renewLoad(cacheLoadNonce);
+        if (cacheClient.restarts === beforeLoadRestarts) throw error;
+        await performLoad();
+      }
       renderBudgets();
       loadProgress.hidden = true;
       dispatchUi({ type: 'LOAD_READY' });
@@ -1582,10 +1683,11 @@ export async function mountEvaChat(): Promise<void> {
             runtimeNoticeText.textContent = 'Eva recovered from a temporary storage write failure. Eva is loaded in this tab and verified model files are on disk.';
           }
         } catch (error) {
+          acquisitionDiagnostic(error);
           patchUiState({
             warning: {
               code: 'write-failed',
-              message: `Eva is ready, but the model cache could not finish: ${error instanceof Error ? error.message : String(error)}`,
+              message: 'Eva is ready, but the local cache could not finish. Retry the cache check before the next load.',
               recoverable: true,
             },
           });
@@ -1593,6 +1695,9 @@ export async function mountEvaChat(): Promise<void> {
       }
     } catch (error) {
       stopCacheLeaseHeartbeat();
+      runtimeRetryNeeded = !downloadPaused;
+      runtime = terminateFailedLoad(runtime);
+      acquisitionWakeLock.stop();
       if (downloadPaused) await pauseWork;
       if (cacheLoadNonce && !downloadPaused) {
         try {
@@ -1603,30 +1708,30 @@ export async function mountEvaChat(): Promise<void> {
       }
       loadProgress.hidden = true;
       if (downloadPaused) {
-        runtime?.terminate();
-        runtime = null;
         patchUiState({ session: 'unloaded', error: null, cacheAction: 'idle', loadSource: null });
         runtimeNoticeText.textContent = 'Download paused. Completed OPFS chunks are retained, unverified and never served. Resume is explicit.';
         downloadStatus.textContent = 'Paused — network lease ended. Resume continues durable Range prefixes; an incomplete chunk is downloaded again. No background download.';
         return;
       }
       if (diskOnly) {
-        runtime?.terminate();
-        runtime = null;
         patchUiState({ session: 'unloaded', error: null, cacheAction: 'idle', warning: null, loadSource: null });
         return;
       }
-      runtimeNoticeText.textContent = `Eva could not load: ${error instanceof Error ? error.message : String(error)}`;
-      liveStatus.textContent = 'The model was not loaded. You can retry without losing this conversation.';
+      acquisitionDiagnostic(error);
+      acquisitionNotice(acquisitionFailure ?? acquisitionFailureCode(error));
+      if (devicePolicy().mobile && acquisitionFailure === 'cache-unavailable') {
+        runtimeNoticeText.textContent = 'Local cache unavailable. This download is paused; no uncached model download was started. Enable site storage or try another browser, then Retry.';
+      }
       dispatchUi({
         type: 'LOAD_FAILED',
-        error: error instanceof Error ? error.message : String(error),
+        error: ACQUISITION_NOTICES[acquisitionFailure ?? acquisitionFailureCode(error)],
       });
       patchUiState({
         residency: cacheStatus?.residency ?? uiState.residency,
         cacheAction: cacheStatus?.cacheAction ?? 'idle',
       });
     } finally {
+      acquisitionWakeLock.stop();
       stopCacheLeaseHeartbeat();
       cacheLoadNonce = null;
       await refreshStorageStatus();
@@ -1634,6 +1739,7 @@ export async function mountEvaChat(): Promise<void> {
   }
 
   async function unloadModel(): Promise<void> {
+    acquisitionWakeLock.stop();
     if (!runtime || uiState.session !== 'ready') {
       return;
     }
@@ -1694,9 +1800,10 @@ export async function mountEvaChat(): Promise<void> {
         ? `Removed ${formatBytes(result.removedBytes)} of Eva model files. Conversations, memories, and profile were kept.`
         : 'No stored Eva model files were found. Conversations, memories, and profile were kept.';
     } catch (error) {
+      acquisitionDiagnostic(error);
       const warning: ModelCacheWarning = {
         code: 'remove-failed',
-        message: `Eva model files could not be removed: ${error instanceof Error ? error.message : String(error)}`,
+        message: 'Eva model files could not be removed: close other tabs using the cache, then retry.',
         recoverable: true,
       };
       if (cacheStatus) {
@@ -1732,7 +1839,8 @@ export async function mountEvaChat(): Promise<void> {
       patchUiState({ residency: result.status.residency, warning: result.status.warning });
       runtimeIntegrity.textContent = failed.length ? 'Failed · repair on next explicit load' : 'SHA-256 re-verification passed';
     } catch (error) {
-      reverifySummary.textContent = `Verification failed: ${error instanceof Error ? error.message : String(error)}. No download was started.`;
+      acquisitionDiagnostic(error);
+      reverifySummary.textContent = 'Verification failed. The local cache could not be checked. Retry; no download was started.';
     } finally { reverifying = false; updateControls(); }
   }
 
@@ -2076,6 +2184,7 @@ export async function mountEvaChat(): Promise<void> {
     localStorage.setItem('kyuby-eva-download-concurrency', downloadConcurrency.value === '4' ? '4' : '2');
   });
   pauseDownload.addEventListener('click', () => {
+    acquisitionWakeLock.stop();
     if (!cacheLoadNonce || uiState.session !== 'loading' || autoResuming) return;
     downloadPaused = true;
     pauseDownload.disabled = true;
@@ -2237,6 +2346,7 @@ export async function mountEvaChat(): Promise<void> {
   window.addEventListener('resize', syncDrawerAccessibility);
   const unsubscribeCache = cacheClient.subscribe(handleCacheMessage);
   window.addEventListener('pagehide', () => {
+    acquisitionWakeLock.stop();
     disposed = true;
     void closeMemoryIndex().catch(() => undefined);
     recovery.stop();

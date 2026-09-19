@@ -1,5 +1,6 @@
-# Node 22.23.2, official linux/amd64 manifest resolved 2026-09-17.
-FROM docker.io/library/node:22.23.2-bookworm-slim@sha256:4d676821dff059fd00d277ee4261ef34ea712317fed0737c03941481b5760c96
+# Node 22.x: Cloudflare Pages build compatibility without freezing patch updates.
+# Each rebuilt image is validated by the smoke checks and full DevPod gates.
+FROM docker.io/library/node:22-bookworm-slim
 LABEL com.kyuby.devpod="true"
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
     WRANGLER_SEND_METRICS=false ASTRO_TELEMETRY_DISABLED=1 \
@@ -25,7 +26,7 @@ RUN mkdir -p /workspace/.astro /workspace/dist /workspace/test-results /workspac
 USER appuser
 ENTRYPOINT ["bash", "/opt/kyuby-devpod/entrypoint.sh"]
 CMD ["make", "-C", "/workspace", "gates"]
-# Build-ending smoke gate: no implicit npx downloads, exact package/lock checks.
-RUN test "$(node --version)" = v22.23.2 \
+# Build-ending smoke gate: Node major only; Playwright/Wrangler stay exact and lockfile-owned.
+RUN test "$(node -p 'process.versions.node.split(".")[0]')" = 22 \
     && test "$(npx --no-install playwright --version)" = "Version $(node -p 'require("./package.json").devDependencies["@playwright/test"]')" \
     && test "$(npx --no-install wrangler --version)" = "$(node -p 'require("./package-lock.json").packages["node_modules/wrangler"].version')"

@@ -25,6 +25,7 @@ gates:
 else
 image dev gates check test test-browser build dry-run deploy-preview clean:
 	@node .github/workflows/devpod/invoke.mjs $@
+# DevPod provides the validated Node 22.x environment; host export only stages/scans/publishes.
 export-public: gates
 	@node .github/workflows/devpod/host.mjs export-public
 deploy-prod ship:

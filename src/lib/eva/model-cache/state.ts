@@ -54,6 +54,7 @@ export interface ModelCacheControlView {
 }
 
 export interface ModelCacheUiView {
+  retryRuntime: boolean;
   bubble: {
     kind: ModelCacheBubbleKind;
     label: string;
@@ -248,6 +249,7 @@ export function deriveModelCacheUi(
   const hasStoredFiles = (options.hasStoredFiles ?? state.residency === 'on-disk')
     || state.warning?.code === 'remove-failed';
   return {
+    retryRuntime: state.preflight === 'unavailable' || state.session === 'unloaded' && state.error !== null,
     bubble: bubbleForState(state),
     load,
     unload: {

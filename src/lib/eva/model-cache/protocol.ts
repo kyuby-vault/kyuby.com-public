@@ -43,6 +43,7 @@ const FILE_ROLES: ReadonlySet<ModelCacheManifestFileRole> = new Set([
 const PROGRESS_PHASES: ReadonlySet<ModelCacheProgressPhase> = new Set([
   'queued',
   'downloading',
+  'retrying',
   'verifying',
   'committing',
   'serving',
@@ -59,6 +60,7 @@ const WARNING_CODES = new Set([
   'network-only',
   'remove-failed',
   'protocol',
+  'cache-service-restarted', 'browser-evicted', 'host-contract', 'connection-lost', 'integrity-failed',
 ]);
 
 interface ModelCacheClientMessageBase {
@@ -88,6 +90,7 @@ export interface ModelCacheBeginLoadMessage extends ModelCacheClientMessageBase 
   manifestVersion: string;
   nonce: string;
   concurrency?: 2 | 4;
+  chunkBytes?: number;
 }
 
 export interface ModelCacheClaimLoadMessage extends ModelCacheClientMessageBase {
@@ -154,6 +157,7 @@ export interface ModelCacheFileProgressMessage extends ModelCacheWorkerMessageBa
   totalBytes: number;
   receivedBytes: number;
   verifiedBytes: number;
+  attempt?: number;
   transfer?: { durableBytes: number; networkBytes: number; resumedBytes: number };
 }
 
@@ -224,6 +228,7 @@ export interface ModelCacheLoadLease {
   pageClientId: string;
   workerClientId: string | null;
   diskOnly: boolean;
+  chunkBytes?: number;
   createdAt: number;
   lastActivityAt: number;
 }
@@ -463,8 +468,10 @@ export function isModelCacheClientMessage(value: unknown): value is ModelCacheCl
     case 'BEGIN_LOAD':
     case 'BEGIN_DISK_LOAD':
       return hasExactKeys(value, ['protocolVersion', 'type', 'requestId', 'modelOrigin', 'modelRootPath', 'manifestVersion', 'nonce',
-        ...(value.concurrency !== undefined ? ['concurrency'] : [])])
+        ...(value.concurrency !== undefined ? ['concurrency'] : []),
+        ...(value.chunkBytes !== undefined ? ['chunkBytes'] : [])])
         && (value.concurrency === undefined || value.concurrency === 2 || value.concurrency === 4)
+        && (value.chunkBytes === undefined || value.chunkBytes === 4 * 1024 * 1024 || value.chunkBytes === 8 * 1024 * 1024)
         && isManifestVersion(value.manifestVersion) && isNonce(value.nonce);
     case 'CLAIM_LOAD':
     case 'RENEW_LOAD':
@@ -555,7 +562,11 @@ export function isModelCacheWorkerMessage(value: unknown): value is ModelCacheWo
         'receivedBytes',
         'verifiedBytes',
         ...(value.transfer !== undefined ? ['transfer'] : []),
+        ...(value.attempt !== undefined ? ['attempt'] : []),
       ])
+        && (value.phase === 'retrying'
+          ? Number.isInteger(value.attempt) && (value.attempt as number) >= 1 && (value.attempt as number) <= 4
+          : value.attempt === undefined)
         && isSafeIntegerInRange(value.totalBytes, MODEL_CACHE_MAX_FILE_BYTES)
         && isSafeIntegerInRange(value.receivedBytes, value.totalBytes)
         && (value.transfer === undefined || (isRecord(value.transfer)

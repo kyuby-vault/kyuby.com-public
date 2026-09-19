@@ -45,7 +45,10 @@ export class OpfsModelCacheBackend implements ModelCacheBlobBackend {
         && previous.resume?.bytes === record.bytes && previous.resume.sha256 === record.sha256
         && Number.isSafeInteger(previous.resume.offset) && previous.resume.offset >= 0 && previous.resume.offset <= record.bytes
         && (await temporaryHandle.getFile()).size >= previous.resume.offset) offset = previous.resume.offset;
-      temporary.resume = { bytes: record.bytes, sha256: record.sha256, offset };
+      if (previous?.resume && previous.resume.offset > 0 && offset === 0) await options.onPartialEvicted?.();
+      // Resume identity comes from the manifest SHA-256, never per-file host ETags.
+      // Reserved marker: even a closed prefix cannot be served before whole-file SHA.
+      temporary.resume = { bytes: record.bytes, sha256: record.sha256, offset, verifiedPrefix: false };
     }
     let promoted = false;
     try {
@@ -76,10 +79,13 @@ export class OpfsModelCacheBackend implements ModelCacheBlobBackend {
       await this.repository.deleteTemporary(temporaryId);
       return complete;
     } catch (error) {
-      // Cancellation/network failure can retain a manifest-pinned prefix. Corrupt
-      // bytes, quota failures and any promoted artifact are always discarded.
+      const quota = error instanceof DOMException && error.name === 'QuotaExceededError';
+      const needed = Math.max(1, record.bytes - offset);
+      const freed = quota && !promoted ? await options.onQuotaFailure?.(needed).catch(() => 0) ?? 0 : 0;
+      // Quota prefixes survive ONLY if cache-owned eviction actually freed enough.
+      // Corrupt bytes and any promoted-but-uncommitted artifact are discarded.
       const keepPrefix = options.acquire && !promoted && !(error instanceof ModelIntegrityError)
-        && !(error instanceof DOMException && error.name === 'QuotaExceededError') && offset > 0;
+        && (!quota || freed >= needed) && offset > 0;
       if (!keepPrefix) await removeOpfsFile(directory, temporaryName).catch(() => undefined);
       if (promoted) await removeOpfsFile(directory, finalName).catch(() => undefined);
       if (!keepPrefix) await this.repository.deleteTemporary(temporaryId).catch(() => undefined);

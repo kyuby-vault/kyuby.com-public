@@ -102,6 +102,7 @@ export type ModelCachePersistenceState = 'persistent' | 'best-effort' | 'browser
 export type ModelCacheProgressPhase =
   | 'queued'
   | 'downloading'
+  | 'retrying'
   | 'verifying'
   | 'committing'
   | 'serving';
@@ -117,6 +118,11 @@ export type ModelCacheWarningCode =
   | 'manifest-updated'
   | 'network-only'
   | 'remove-failed'
+  | 'cache-service-restarted'
+  | 'browser-evicted'
+  | 'host-contract'
+  | 'connection-lost'
+  | 'integrity-failed'
   | 'protocol';
 
 export interface ModelCacheWarning {
