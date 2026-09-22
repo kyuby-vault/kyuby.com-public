@@ -1,4 +1,4 @@
-import { hashBytes, verifyBlobIntegrity } from './integrity';
+import { hashBytes, ModelIntegrityError, verifyBlobIntegrity } from './integrity';
 import { normalizeStrongModelCacheEtag } from './manifest';
 import {
   MODEL_CACHE_MAX_MANIFEST_BYTES,
@@ -97,6 +97,8 @@ export type ModelCacheBodySource = Blob | ReadableStream<Uint8Array>;
 export interface ModelCacheWriteOptions {
   assertCanCommit?: () => void;
   onVerifyProgress?: (hashedBytes: number, totalBytes: number) => void | Promise<void>;
+  onCommitProgress?: (hashedBytes: number, totalBytes: number) => void | Promise<void>;
+  onResumeProgress?: (hashedBytes: number, prefixBytes: number) => void | Promise<void>;
   acquire?: (handle: FileSystemFileHandle, offset: number, checkpoint: (offset: number) => Promise<void>) => Promise<void>;
   onQuotaFailure?: (neededBytes: number) => Promise<number>;
   onPartialEvicted?: () => void | Promise<void>;
@@ -508,7 +510,10 @@ export class ModelCacheStore {
             { bytes: expected.bytes, sha256: expected.sha256 },
             { onProgress: options.onVerifyProgress },
           ));
-        } catch {
+        } catch (error) {
+          // Cancellation/timeout is not evidence of corrupt bytes. Never delete
+          // a healthy shared file because its requesting page closed mid-hash.
+          if (!(error instanceof ModelIntegrityError)) throw error;
           await this.#dropFile(record);
           return null;
         }

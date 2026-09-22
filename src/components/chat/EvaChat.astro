@@ -249,7 +249,11 @@
       <button class="text-button" id="resume-download" type="button" hidden>Resume download</button>
       <p id="download-status" role="status">Completed Range chunks are resumable for 24 hours. Partial files are never served. Speed / ETA exclude final verification and inference setup.</p>
       <p id="download-visibility-hint" role="status" hidden></p>
-      <ul id="cache-file-progress" aria-label="Model file progress"></ul>
+      <details id="cache-progress-details">
+        <summary>Details: model files and verification</summary>
+        <ul id="cache-file-progress" aria-label="Model file progress"></ul>
+      </details>
+      <p class="runtime-action-note">Tabs share verified disk files and one download, not GPU memory. Each loaded tab uses its own model session.</p>
       <p id="reverify-summary" role="status"></p>
       <ul id="reverify-results" aria-label="Local checksum results"></ul>
       <p class="runtime-action-note">Clearing conversations, memory, and profile does not remove model files.</p>

@@ -103,8 +103,11 @@ export type ModelCacheProgressPhase =
   | 'queued'
   | 'downloading'
   | 'retrying'
+  | 'resuming'
+  | 'verifying-resumed-prefix'
   | 'verifying'
   | 'committing'
+  | 'done'
   | 'serving';
 
 export type ModelCacheWarningCode =

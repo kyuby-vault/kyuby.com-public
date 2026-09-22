@@ -44,8 +44,11 @@ const PROGRESS_PHASES: ReadonlySet<ModelCacheProgressPhase> = new Set([
   'queued',
   'downloading',
   'retrying',
+  'resuming',
+  'verifying-resumed-prefix',
   'verifying',
   'committing',
+  'done',
   'serving',
 ]);
 const WARNING_CODES = new Set([
@@ -147,6 +150,23 @@ export interface ModelCacheStatusMessage extends ModelCacheWorkerMessageBase {
   status: ModelCacheStatus;
 }
 
+export interface ModelCacheRenewAck extends ModelCacheWorkerMessageBase {
+  type: 'RENEW_ACK';
+  nonce: string;
+  expiresAt: number;
+}
+
+export interface ModelCacheLeaseState extends ModelCacheWorkerMessageBase {
+  type: 'LEASE_STATE';
+  nonce: string;
+  kind: 'acquiring' | 'attached' | 'disk';
+}
+
+export interface ModelCachePackageComplete extends ModelCacheWorkerMessageBase {
+  type: 'PACKAGE_COMPLETE';
+  nonce: string;
+}
+
 export interface ModelCacheFileProgressMessage extends ModelCacheWorkerMessageBase {
   type: 'FILE_PROGRESS';
   manifestVersion: string;
@@ -207,6 +227,9 @@ export interface ModelCacheErrorMessage extends ModelCacheWorkerMessageBase {
 
 export type ModelCacheWorkerMessage =
   | ModelCacheStatusMessage
+  | ModelCacheRenewAck
+  | ModelCacheLeaseState
+  | ModelCachePackageComplete
   | ModelCacheVerifyResultMessage
   | ModelCacheFileProgressMessage
   | ModelCacheSourceChangedMessage
@@ -228,6 +251,7 @@ export interface ModelCacheLoadLease {
   pageClientId: string;
   workerClientId: string | null;
   diskOnly: boolean;
+  kind: 'acquiring' | 'attached' | 'disk';
   chunkBytes?: number;
   createdAt: number;
   lastActivityAt: number;
@@ -547,6 +571,17 @@ export function isModelCacheWorkerMessage(value: unknown): value is ModelCacheWo
           && (file.status === 'passed' || file.status === 'failed'))
         && new Set(value.files.map((file) => file.file)).size === value.files.length
         && isStatus(value.status) && workerMessageMatchesBase(value, value.status);
+    case 'RENEW_ACK':
+      return hasExactKeys(value, [...base, 'nonce', 'expiresAt']) && isNonce(value.nonce)
+        && isManifestVersion(value.manifestVersion)
+        && isSafeIntegerInRange(value.expiresAt, Number.MAX_SAFE_INTEGER);
+    case 'LEASE_STATE':
+      return hasExactKeys(value, [...base, 'nonce', 'kind']) && isNonce(value.nonce)
+        && isManifestVersion(value.manifestVersion)
+        && ['acquiring', 'attached', 'disk'].includes(String(value.kind));
+    case 'PACKAGE_COMPLETE':
+      return hasExactKeys(value, [...base, 'nonce']) && isNonce(value.nonce)
+        && isManifestVersion(value.manifestVersion);
     case 'STATUS':
       return hasExactKeys(value, [...base, 'status'])
         && isStatus(value.status)
@@ -586,7 +621,7 @@ export function isModelCacheWorkerMessage(value: unknown): value is ModelCacheWo
         && isSafeIntegerInRange(value.totalBytes, MODEL_CACHE_MAX_FILE_BYTES)
         && isSafeIntegerInRange(value.receivedBytes, value.totalBytes)
         && isSafeIntegerInRange(value.verifiedBytes, value.totalBytes)
-        && (value.verifiedBytes === 0 || value.phase === 'serving')
+        && (value.verifiedBytes === 0 || value.phase === 'serving' || value.phase === 'done')
         && value.loadedBytes <= value.totalBytes;
     case 'SOURCE_CHANGED':
       return hasExactKeys(value, [...base, 'source', 'reason'])
@@ -673,6 +708,7 @@ export function createModelCacheLoadLease(
     pageClientId,
     workerClientId: null,
     diskOnly: message.type === 'BEGIN_DISK_LOAD',
+    kind: message.type === 'BEGIN_DISK_LOAD' ? 'disk' : 'acquiring',
     createdAt: now,
     lastActivityAt: now,
   };

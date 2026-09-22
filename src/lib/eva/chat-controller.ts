@@ -508,6 +508,7 @@ export async function mountEvaChat(): Promise<void> {
   const reverifySummary = requiredElement<HTMLElement>('reverify-summary');
   const reverifyResults = requiredElement<HTMLUListElement>('reverify-results');
   const cacheProgressSummary = requiredElement<HTMLElement>('cache-progress-summary');
+  requiredElement<HTMLDetailsElement>('cache-progress-details').open = !matchMedia('(pointer: coarse), (max-width: 640px)').matches;
   const pagingStatus = requiredElement<HTMLElement>('context-paging-status');
   const contextManager = new ContextManager();
   const generationActivity = new GenerationActivity();
@@ -584,6 +585,7 @@ export async function mountEvaChat(): Promise<void> {
   let reverifying = false;
   let autoResuming = false;
   let cacheProgress = new ModelCacheProgress(null);
+  let sharedAcquisition = false;
   let capacity: AcquisitionCapacity = 'ok';
   let acquisitionFailure: AcquisitionNoticeCode | null = null;
   let runtimeRetryNeeded = false;
@@ -740,8 +742,8 @@ export async function mountEvaChat(): Promise<void> {
           }
           acquisitionDiagnostic(error);
           const warning: ModelCacheWarning = {
-            code: 'protocol',
-            message: ACQUISITION_NOTICES['cache-unavailable'],
+            code: 'connection-lost',
+            message: ACQUISITION_NOTICES['connection-lost'],
             recoverable: true,
           };
           runtimeNoticeText.textContent = warning.message;
@@ -1164,6 +1166,19 @@ export async function mountEvaChat(): Promise<void> {
   }
 
   function handleCacheMessage(message: ModelCacheWorkerMessage): void {
+    if (message.type === 'LEASE_STATE') {
+      sharedAcquisition = message.kind === 'attached';
+      if (sharedAcquisition) runtimeNoticeText.textContent = 'Joining download · Network (shared). Each tab still uses its own GPU memory.';
+      return;
+    }
+    if (message.type === 'PACKAGE_COMPLETE') {
+      // Disk readiness is not inference readiness. LOAD_READY is emitted only
+      // after this tab's ORT session has actually loaded, never on a cache event.
+      if (message.manifestVersion === modelConfig?.manifestVersion) {
+        patchUiState({ residency: 'on-disk', cacheAction: 'idle' });
+      }
+      return;
+    }
     if (autoResuming && (message.type === 'CACHE_WARNING' && message.warning.code !== 'cache-service-restarted' || message.type === 'ERROR')) return;
     if (message.type === 'STATUS') {
       cacheStatus = message.status;
@@ -1189,14 +1204,13 @@ export async function mountEvaChat(): Promise<void> {
       if (uiState.session !== 'loading') {
         return;
       }
-      if ((message.phase === 'verifying' || message.phase === 'committing')
-        && uiState.cacheAction !== 'verifying') {
-        patchUiState({ cacheAction: 'verifying' });
-      }
       if (!cacheProgress.update(message)) return;
       if (message.phase === 'retrying') {
         acquisitionNotice('connection-lost');
         runtimeNoticeText.textContent = `Connection dropped — retrying (${message.attempt}/4). Resuming from the durable checkpoint.`;
+      } else if (message.phase === 'resuming' || message.phase === 'verifying-resumed-prefix') {
+        acquisitionNotice('resuming');
+        runtimeNoticeText.textContent = 'Resuming: checking the saved prefix before the next Range request. The full file must still pass SHA-256.';
       } else if (message.phase === 'verifying') acquisitionNotice('verifying');
       else if (message.transfer && message.transfer.resumedBytes > 0) acquisitionNotice('resuming');
       if (message.transfer) {
@@ -1212,11 +1226,12 @@ export async function mountEvaChat(): Promise<void> {
         downloadStatus.dataset.durableBytes = String(durable);
       }
       const percent = cacheProgress.percent;
-      cacheProgressSummary.textContent = `${percent}% aggregate · received ${formatBytes(cacheProgress.received)} · verified ${formatBytes(cacheProgress.verified)} / ${formatBytes(cacheProgress.total)}. Verification is counted only after the full digest passes.`;
+      cacheProgressSummary.textContent = `${percent}% aggregate · Downloaded ${formatBytes(cacheProgress.received)} of ${formatBytes(cacheProgress.total)} · Verified ${formatBytes(cacheProgress.verified)} of ${formatBytes(cacheProgress.total)} · ${cacheProgress.completeFiles} of ${cacheProgress.files.size} files complete.`;
       cacheFileProgress.replaceChildren(...[...cacheProgress.files.values()].map((file) => {
         const item = document.createElement('li');
         item.dataset.file = file.file;
         item.dataset.percent = String(file.percent);
+        item.dataset.phase = file.phase;
         item.textContent = `${file.file} · ${Math.floor(file.percent)}% · ${file.source} · ${file.phase} · received ${formatBytes(file.received)}, verified ${formatBytes(file.verified)} / ${formatBytes(file.total)}`;
         return item;
       }));
@@ -1224,12 +1239,13 @@ export async function mountEvaChat(): Promise<void> {
         ? 'Downloading'
         : message.phase === 'verifying' ? 'Verifying'
           : message.phase === 'committing' ? 'Finalizing'
-            : message.phase === 'serving' ? 'Loading' : 'Preparing';
+            : message.phase === 'resuming' || message.phase === 'verifying-resumed-prefix' ? 'Resuming: checking saved prefix'
+              : message.phase === 'serving' || message.phase === 'done' ? 'Loading' : 'Preparing';
       loadProgress.hidden = false;
       loadProgressBar.value = percent;
       loadProgressBar.textContent = `${percent}%`;
       loadProgressValue.textContent = `${percent}%`;
-      loadProgressLabel.textContent = `${phase} ${message.file.split('/').at(-1)} · ${message.source === 'disk' ? 'Disk' : 'Network'}`;
+      loadProgressLabel.textContent = `${phase} ${message.file.split('/').at(-1)} · ${message.source === 'disk' ? 'Disk' : sharedAcquisition ? 'Network (shared)' : 'Network'}`;
       return;
     }
 
@@ -1580,12 +1596,18 @@ export async function mountEvaChat(): Promise<void> {
     dispatchUi({ type: 'LOAD_STARTED', source: initialSource });
 
     try {
-      await refreshStorageStatus();
-      if (!diskOnly && capacity === 'insufficient') throw new DOMException('Insufficient acquisition storage.', 'QuotaExceededError');
-      if (cacheClient.availability.available && modelConfig.manifest.cacheInventory && !cacheConfigured) {
-        cacheStatus = await cacheClient.ensureConfigured();
+      if ((!fixtureMode || fixtureMode === 'model-cache') && 'serviceWorker' in navigator && !cacheClient.availability.available) {
+        acquisitionFailure = 'cache-unavailable';
+        throw new Error('The cache service has not attached. Retry instead of starting an uncached download.');
+      }
+      if (cacheClient.availability.available && modelConfig.manifest.cacheInventory) {
+        // Residency is a fresh SW answer, not this tab's previous-load guess.
+        // GET_STATUS also exercises the one-replay recovery when globals died.
+        cacheStatus = cacheConfigured ? await cacheClient.getStatus() : await cacheClient.ensureConfigured();
         cacheConfigured = true;
       }
+      await refreshStorageStatus();
+      if (!diskOnly && capacity === 'insufficient') throw new DOMException('Insufficient acquisition storage.', 'QuotaExceededError');
       if (diskOnly && !cacheConfigured) throw new Error('Disk-only loading requires the verified local cache.');
       if (cacheConfigured) {
         try {
@@ -1594,7 +1616,7 @@ export async function mountEvaChat(): Promise<void> {
           catch (error) {
             // RPC-coded failures already consumed their one self-heal replay.
             // Transport/timeouts get one explicit configure + begin attempt here.
-            if (error instanceof ModelCacheRpcError) throw error;
+            if (error instanceof ModelCacheRpcError && error.code !== 'RPC_TIMEOUT') throw error;
             await cacheClient.ensureConfigured();
             cacheLoadNonce = await cacheClient.beginLoad(diskOnly, policy.concurrency, policy.chunkBytes);
           }

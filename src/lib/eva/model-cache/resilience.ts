@@ -46,6 +46,7 @@ export async function acquireWithRetry<T>(options: {
   attempt(): Promise<T>;
   fallback(): Promise<T>;
   retrying(attempt: number): void | Promise<void>;
+  activity?(): void | Promise<void>;
   wait?: typeof waitForAcquisitionRetry;
   random?: () => number;
 }): Promise<T> {
@@ -56,7 +57,9 @@ export async function acquireWithRetry<T>(options: {
       options.signal.throwIfAborted();
       if (!isAcquisitionNetworkError(error)) throw error;
       await options.retrying(attempt);
+      await options.activity?.();
       await (options.wait ?? waitForAcquisitionRetry)(acquisitionBackoff(attempt, options.random), options.signal);
+      await options.activity?.();
     }
   }
   options.signal.throwIfAborted();

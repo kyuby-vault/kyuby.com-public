@@ -1,12 +1,16 @@
 /// <reference lib="webworker" />
 
 import { ModelIntegrityError, verifyBlobIntegrity } from '../lib/eva/model-cache/integrity';
+import { ModelDigestTimeoutError } from '../lib/eva/model-cache/digest-scheduler';
 import { acquireModelChunks, RangeUnavailableError } from '../lib/eva/model-cache/acquisition';
 import { acquireWithRetry, acquisitionNetworkOperation, isAcquisitionNetworkError, AcquisitionNetworkError, DESKTOP_CHUNK_BYTES } from '../lib/eva/model-cache/resilience';
 import { writeOpfsStream } from '../lib/eva/model-cache/opfs-files';
+import { arbitrateModelLeases, sameLeasePackage } from '../lib/eva/model-cache/arbitration';
 import { parseModelCacheManifestBytes } from '../lib/eva/model-cache/manifest';
 import {
   MODEL_CACHE_PROTOCOL_VERSION,
+  MODEL_CACHE_LOAD_LEASE_IDLE_MS,
+  MODEL_CACHE_LOAD_LEASE_ABSOLUTE_MS,
   bindModelCacheClientMessage,
   claimModelCacheLoadLease,
   createModelCacheLoadLease,
@@ -87,6 +91,7 @@ interface ArtifactAcquisitionContext {
   modelOrigin: string;
   modelRootPath: string;
   manifestVersion: string;
+  hashReports: Map<string, { phase: string; at: number }>;
 }
 
 interface ArtifactAcquisition extends ArtifactAcquisitionContext {
@@ -121,6 +126,8 @@ class AsyncSemaphore {
 const configuredRoots = new Map<string, ConfiguredRoot>();
 const selectedVersions = new Map<string, string>();
 const loadLeases = new Map<string, ModelCacheLoadLease>();
+const completedLeases = new Set<string>();
+let clientCheckAt = 0;
 const leaseFailures = new Map<string, Map<string, unknown>>();
 const artifactAcquisitions = new Map<string, ArtifactAcquisition>();
 const transferSemaphore = new AsyncSemaphore(MAX_ARTIFACT_TRANSFERS);
@@ -129,6 +136,7 @@ let developmentBackend: 'auto' | 'opfs' | 'none' = 'auto';
 let developmentFailNextWriteWithQuota = false;
 let developmentQuotaAfterOffset = 0;
 let developmentStateReset: Promise<void> | null = null;
+let developmentDropRenew = false;
 
 function modelRootKey(modelOrigin: string, modelRootPath: string): string {
   return JSON.stringify([modelOrigin, modelRootPath]);
@@ -206,7 +214,7 @@ async function handleDevelopmentFault(event: ExtendableMessageEvent, client: Cli
     // DEV only: mimic loss of the global, not deletion of durable bytes/metadata.
     const pending = [...artifactAcquisitions.values()].map((entry) => entry.promise);
     abortArtifactAcquisitions(() => true, 'Injected cache service restart.');
-    configuredRoots.clear(); selectedVersions.clear(); loadLeases.clear(); leaseFailures.clear();
+    configuredRoots.clear(); selectedVersions.clear(); loadLeases.clear(); leaseFailures.clear(); completedLeases.clear();
     const previousStore = storePromise;
     developmentStateReset = (async () => {
       await Promise.allSettled(pending);
@@ -216,6 +224,11 @@ async function handleDevelopmentFault(event: ExtendableMessageEvent, client: Cli
     })();
     await developmentStateReset;
     developmentStateReset = null;
+    postRpcResponse(event, client, { ok: true });
+    return true;
+  }
+  if (message.action === 'drop-next-renew') {
+    developmentDropRenew = true;
     postRpcResponse(event, client, { ok: true });
     return true;
   }
@@ -284,12 +297,45 @@ function pruneExpiredLeases(now = Date.now()): void {
 
 function releaseLeaseFromArtifactAcquisitions(nonce: string, reason: string): void {
   leaseFailures.delete(nonce);
+  completedLeases.delete(nonce);
+  arbitrateModelLeases(loadLeases.values());
   for (const acquisition of artifactAcquisitions.values()) {
     if (acquisition.leaseNonces.delete(nonce)
       && acquisition.leaseNonces.size === 0
       && !acquisition.controller.signal.aborted) {
       acquisition.controller.abort(new DOMException(reason, 'AbortError'));
     }
+  }
+}
+
+async function acquisitionActivity(context: ArtifactAcquisitionContext): Promise<ModelCacheLoadLease[]> {
+  const now = Date.now();
+  // Client liveness is separate from idle work liveness. Do not renew a dead
+  // owner's authority forever merely because an attached tab is downloading.
+  if (now - clientCheckAt >= 1_000) {
+    clientCheckAt = now;
+    const clients = new Set((await self.clients.matchAll({ type: 'window', includeUncontrolled: true })).map(client => client.id));
+    for (const [nonce, lease] of loadLeases) {
+      if (!clients.has(lease.pageClientId)) {
+        loadLeases.delete(nonce);
+        releaseLeaseFromArtifactAcquisitions(nonce, 'Acquiring page closed.');
+      }
+    }
+  }
+  const leases = liveAcquisitionLeases(context);
+  for (const lease of leases) lease.lastActivityAt = now;
+  return leases;
+}
+
+async function packageComplete(root: ConfiguredRoot, version: string): Promise<void> {
+  const inventory = root.versions.get(version)?.inventory;
+  if (!inventory || (await (await getStore())?.getPackage({ inventory }))?.state !== 'complete') return;
+  for (const lease of loadLeases.values()) {
+    if (!sameLeasePackage(lease, { ...root, manifestVersion: version }) || completedLeases.has(lease.nonce)) continue;
+    completedLeases.add(lease.nonce); // before any await: exactly once per lease
+    await postToClient(lease.pageClientId, {
+      ...workerMessageBase(lease.pageClientId, lease, version), type: 'PACKAGE_COMPLETE', nonce: lease.nonce,
+    });
   }
 }
 
@@ -339,6 +385,7 @@ function liveAcquisitionLeases(context: ArtifactAcquisitionContext): ModelCacheL
       context.leaseNonces.delete(nonce);
       if (lease && isModelCacheLoadLeaseExpired(lease, now)) {
         loadLeases.delete(nonce);
+        arbitrateModelLeases(loadLeases.values());
         void getStore().then((store) => store?.endVerificationScope(nonce));
       }
       continue;
@@ -762,6 +809,17 @@ async function handleClientMessage(event: ExtendableMessageEvent): Promise<void>
   }
   if (message.type === 'BEGIN_LOAD' || message.type === 'BEGIN_DISK_LOAD') {
     pruneExpiredLeases();
+    if (client.type !== 'window' || selectedVersions.get(clientRootKey(client.id, key)) !== message.manifestVersion) {
+      replyError(event, client, message, 'LEASE_REJECTED', 'An explicitly configured page must request the load lease.');
+      return;
+    }
+    const previous = loadLeases.get(message.nonce);
+    // A lost ACK is replayed with the SAME explicit nonce, never a new lease.
+    if (previous && previous.pageClientId === client.id && sameLeasePackage(previous, message)
+      && previous.diskOnly === (message.type === 'BEGIN_DISK_LOAD')) {
+      await replyStatus(event, client, message, root);
+      return;
+    }
     if (!root.versions.has(message.manifestVersion)
       || loadLeases.has(message.nonce)
       || loadLeases.size >= MAX_ACTIVE_LOAD_LEASES) {
@@ -781,6 +839,15 @@ async function handleClientMessage(event: ExtendableMessageEvent): Promise<void>
     lease.chunkBytes = message.chunkBytes;
     if (loadLeases.size === 0) transferSemaphore.setLimit(message.concurrency ?? 2);
     loadLeases.set(lease.nonce, lease);
+    arbitrateModelLeases(loadLeases.values());
+    for (const acquisition of artifactAcquisitions.values()) {
+      if (!lease.diskOnly && sameLeasePackage(lease, acquisition) && !acquisition.controller.signal.aborted) {
+        acquisition.leaseNonces.add(lease.nonce);
+      }
+    }
+    await postToClient(client.id, {
+      ...workerMessageBase(client.id, lease, lease.manifestVersion), type: 'LEASE_STATE', nonce: lease.nonce, kind: lease.kind,
+    });
     await replyStatus(event, client, message, root);
     return;
   }
@@ -797,6 +864,7 @@ async function handleClientMessage(event: ExtendableMessageEvent): Promise<void>
     return;
   }
   if (message.type === 'RENEW_LOAD') {
+    if (__EVA_MODEL_CACHE_DEV__ && developmentDropRenew) { developmentDropRenew = false; return; }
     const lease = loadLeases.get(message.nonce);
     const result = lease
       ? renewModelCacheLoadLease(lease, message, client.id, Date.now())
@@ -806,7 +874,13 @@ async function handleClientMessage(event: ExtendableMessageEvent): Promise<void>
       return;
     }
     loadLeases.set(message.nonce, result.lease);
-    await replyStatus(event, client, message, root);
+    // Liveness only: deliberately no store lookup or storage.estimate roundtrip.
+    postRpcResponse(event, client, {
+      ...workerMessageBase(client.id, root, message.manifestVersion, message.requestId),
+      type: 'RENEW_ACK', nonce: message.nonce,
+      expiresAt: Math.min(result.lease.lastActivityAt + MODEL_CACHE_LOAD_LEASE_IDLE_MS,
+        result.lease.createdAt + MODEL_CACHE_LOAD_LEASE_ABSOLUTE_MS),
+    } satisfies ModelCacheWorkerMessage);
     return;
   }
   if (message.type === 'END_LOAD' || message.type === 'CANCEL_LOAD') {
@@ -1152,13 +1226,19 @@ async function reportHashProgress(
   acquisition: ArtifactAcquisitionContext,
   loadedBytes: number,
   complete = false,
+  phase: 'verifying' | 'committing' = 'verifying',
 ): Promise<void> {
-  for (const lease of liveAcquisitionLeases(acquisition)) {
-    lease.lastActivityAt = Date.now();
+  const leases = await acquisitionActivity(acquisition);
+  const previous = acquisition.hashReports.get(file.path);
+  const now = Date.now();
+  if (!complete && loadedBytes !== file.bytes && previous?.phase === phase
+    && now - previous.at < PROGRESS_INTERVAL_MS) return;
+  acquisition.hashReports.set(file.path, { phase, at: now });
+  for (const lease of leases) {
     await postLeaseMessage(lease, (clientId) => ({
       ...workerMessageBase(clientId, lease, lease.manifestVersion),
       type: 'FILE_PROGRESS', file: file.path, source: 'network',
-      phase: complete ? 'serving' : 'verifying', loadedBytes, totalBytes: file.bytes,
+      phase: complete ? 'done' : phase, loadedBytes, totalBytes: file.bytes,
       receivedBytes: file.bytes, verifiedBytes: complete ? file.bytes : 0,
     }));
   }
@@ -1258,12 +1338,16 @@ async function acquireArtifact(
     const packageRecord = await store.getPackage(descriptor);
     packageWasComplete = packageRecord?.state === 'complete';
     let cached: Blob | null = null;
+    let lastVerifyReport = 0;
     try {
       cached = await store.readFile(descriptor, file.path, {
         verificationScope: matched.lease?.nonce,
         reverify: !matched.lease,
         onVerifyProgress: matched.lease ? async (loadedBytes) => {
           const lease = requireLiveLease(matched.lease!);
+          lease.lastActivityAt = Date.now();
+          if (loadedBytes !== file.bytes && Date.now() - lastVerifyReport < PROGRESS_INTERVAL_MS) return;
+          lastVerifyReport = Date.now();
           await postLeaseMessage(lease, (clientId) => ({
             ...workerMessageBase(clientId, lease, lease.manifestVersion),
             type: 'FILE_PROGRESS', file: file.path, source: 'disk', phase: 'verifying',
@@ -1271,7 +1355,8 @@ async function acquireArtifact(
           }));
         } : undefined,
       });
-    } catch {
+    } catch (error) {
+      if (error instanceof ModelDigestTimeoutError || error instanceof DOMException && error.name === 'AbortError') throw error;
       await store.invalidateFile(descriptor, file.path).catch(() => undefined);
       packageWasComplete = true;
     }
@@ -1290,6 +1375,7 @@ async function acquireArtifact(
           verifiedBytes: file.bytes,
         }));
       }
+      await packageComplete(matched.root, inventory.manifestIdentity.manifestVersion);
       return { blob: cached, source: 'disk' };
     }
   }
@@ -1320,8 +1406,9 @@ async function acquireArtifact(
 
   const controller = new AbortController();
   const acquisitionContext: ArtifactAcquisitionContext = {
+    hashReports: new Map(),
     controller,
-    leaseNonces: new Set([lease.nonce]),
+    leaseNonces: new Set([...loadLeases.values()].filter(other => !other.diskOnly && sameLeasePackage(other, lease)).map(other => other.nonce)),
     rootKey: modelRootKey(inventory.modelOrigin, inventory.modelRootPath),
     modelOrigin: inventory.modelOrigin,
     modelRootPath: inventory.modelRootPath,
@@ -1359,6 +1446,7 @@ async function acquireArtifact(
         await store.putFile(descriptor, file.path, blob, {
           assertCanCommit: () => requireLiveAcquisitionLease(acquisitionContext),
           onVerifyProgress: (bytes) => reportHashProgress(file, acquisitionContext, bytes),
+          onCommitProgress: (bytes) => reportHashProgress(file, acquisitionContext, bytes, false, 'committing'),
         });
         requireLiveAcquisitionLease(acquisitionContext);
         return { blob: await store.readFile(descriptor, file.path) ?? blob, source: 'network' };
@@ -1379,6 +1467,17 @@ async function acquireArtifact(
       const stored = await store.putFile(descriptor, file.path, response?.body ?? new Blob(), {
         assertCanCommit: () => requireLiveAcquisitionLease(acquisitionContext),
         onVerifyProgress: (bytes) => reportHashProgress(file, acquisitionContext, bytes),
+        onCommitProgress: (bytes) => reportHashProgress(file, acquisitionContext, bytes, false, 'committing'),
+        onResumeProgress: async (bytes, prefix) => {
+          for (const lease of await acquisitionActivity(acquisitionContext)) {
+            await postLeaseMessage(lease, clientId => ({
+              ...workerMessageBase(clientId, lease, lease.manifestVersion), type: 'FILE_PROGRESS',
+              file: file.path, source: 'network', phase: bytes === 0 ? 'resuming' : 'verifying-resumed-prefix',
+              loadedBytes: bytes, totalBytes: file.bytes, receivedBytes: prefix, verifiedBytes: 0,
+              transfer: { durableBytes: prefix, resumedBytes: prefix, networkBytes: 0 },
+            }));
+          }
+        },
         onQuotaFailure: async (needed) => {
           const freed = await store.evictOwned(needed, pinnedPackageKeys(descriptor)).catch(() => 0);
           quotaRecovered = freed >= needed;
@@ -1396,7 +1495,10 @@ async function acquireArtifact(
               total: file.bytes, signal: acquisitionContext.controller.signal,
               // Small deterministic fixtures keep their eight-chunk cadence.
               chunkBytes: Math.min(activeLease.chunkBytes ?? DESKTOP_CHUNK_BYTES, Math.max(16 * 1024, Math.ceil(file.bytes / 8))),
-              checkpoint: async (completed) => { await checkpoint(completed); durableOffset = completed; },
+              checkpoint: async (completed) => {
+                await checkpoint(completed); durableOffset = completed;
+                await acquisitionActivity(acquisitionContext);
+              },
               fetch: async (start, end) => {
                 requireLiveAcquisitionLease(acquisitionContext);
                 const result = await fetch(matched.route.url, { mode: 'cors', credentials: 'omit', redirect: 'error', cache: 'no-store',
@@ -1415,7 +1517,7 @@ async function acquireArtifact(
                   // checkpoint. Exercises reader cancellation and writer abort.
                   throw new DOMException('Injected mid-chunk quota failure.', 'QuotaExceededError');
                 }
-                const leases = liveAcquisitionLeases(acquisitionContext);
+                const leases = await acquisitionActivity(acquisitionContext);
                 const now = Date.now();
                 for (const lease of leases) lease.lastActivityAt = now;
                 if (now - lastReport < PROGRESS_INTERVAL_MS && received !== durable) return;
@@ -1449,8 +1551,9 @@ async function acquireArtifact(
     try {
       return await acquireWithRetry({
         signal: controller.signal, attempt, fallback,
+        activity: async () => { await acquisitionActivity(acquisitionContext); },
         retrying: async (attempt) => {
-          for (const lease of liveAcquisitionLeases(acquisitionContext)) {
+          for (const lease of await acquisitionActivity(acquisitionContext)) {
             lease.lastActivityAt = Date.now();
             await postLeaseMessage(lease, (clientId) => ({
               ...workerMessageBase(clientId, lease, lease.manifestVersion), type: 'FILE_PROGRESS',
@@ -1485,6 +1588,7 @@ async function acquireArtifact(
     }
   }).then(async (result) => {
     await reportHashProgress(file, acquisitionContext, file.bytes, true);
+    await packageComplete(matched.root, inventory.manifestIdentity.manifestVersion);
     return result;
   }).catch(async (error: unknown) => {
     if (!controller.signal.aborted) {
@@ -1535,9 +1639,6 @@ async function handleArtifactFetch(
   }
   const result = await acquireArtifact(matched);
   if (!result) {
-    if (request.headers.has('Range')) {
-      return fetch(request);
-    }
     return explicitLoadRequiredResponse(request.method);
   }
   return createModelBlobResponse(result.blob, {

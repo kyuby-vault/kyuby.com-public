@@ -22,7 +22,7 @@ const RPC_TIMEOUT_MS = 10_000;
 const REMOVE_MODEL_RPC_TIMEOUT_MS = 10 * 60 * 1_000;
 
 export class ModelCacheRpcError extends Error {
-  constructor(readonly code: Extract<ModelCacheWorkerMessage, { type: 'ERROR' }>['code'], message: string) { super(message); }
+  constructor(readonly code: Extract<ModelCacheWorkerMessage, { type: 'ERROR' }>['code'] | 'RPC_TIMEOUT', message: string) { super(message); }
 }
 
 export interface ModelCacheRoot {
@@ -138,7 +138,10 @@ export class EvaModelCacheClient extends EventTarget {
   get restarts(): number { return this.#restarts; }
 
   initialize(): Promise<ModelCacheClientAvailability> {
-    this.#initializePromise ??= this.#initialize();
+    this.#initializePromise ??= this.#initialize().then(result => {
+      if (!result.available) this.#initializePromise = null; // explicit Retry can attach again
+      return result;
+    });
     return this.#initializePromise;
   }
 
@@ -213,7 +216,7 @@ export class EvaModelCacheClient extends EventTarget {
     return response.status;
   }
 
-  async renewLoad(nonce: string): Promise<ModelCacheStatus> {
+  async renewLoad(nonce: string): Promise<Extract<ModelCacheWorkerMessage, { type: 'RENEW_ACK' }>> {
     if (this.#activeLoad && Date.now() - this.#leaseStartedAt >= MODEL_CACHE_LOAD_LEASE_ABSOLUTE_MS) {
       throw new ModelCacheRpcError('LEASE_REJECTED', 'The explicit load lease expired.');
     }
@@ -221,8 +224,9 @@ export class EvaModelCacheClient extends EventTarget {
       ...this.#baseMessage(this.#requireManifestVersion()),
       type: 'RENEW_LOAD',
       nonce,
-    }, 'STATUS');
-    return response.status;
+    }, 'RENEW_ACK');
+    if (response.nonce !== nonce) throw new ModelCacheRpcError('LEASE_REJECTED', 'Mismatched renewal nonce.');
+    return response;
   }
 
   async cancelLoad(nonce: string): Promise<ModelCacheStatus> {
@@ -323,7 +327,8 @@ export class EvaModelCacheClient extends EventTarget {
     try { return await this.#send(message, expectedType, timeoutMs); }
     catch (error) {
       if (message.type === 'CONFIGURE' || !(error instanceof ModelCacheRpcError)
-        || !['NOT_CONFIGURED', 'LEASE_REJECTED'].includes(error.code) || !this.#inventory) throw error;
+        || !(['NOT_CONFIGURED', 'LEASE_REJECTED'].includes(error.code)
+          || message.type === 'RENEW_LOAD' && error.code === 'RPC_TIMEOUT') || !this.#inventory) throw error;
       // Exactly one replay. CONFIGURE and the replay bypass this recovery wrapper.
       this.#recovering ??= (async () => {
         await this.ensureConfigured();
@@ -357,7 +362,7 @@ export class EvaModelCacheClient extends EventTarget {
       const timeout = globalThis.setTimeout(() => {
         this.#pending.delete(message.requestId);
         channel.port1.close();
-        reject(new Error(`Eva model cache ${message.type} request timed out.`));
+        reject(new ModelCacheRpcError('RPC_TIMEOUT', `Eva model cache ${message.type} request timed out.`));
       }, timeoutMs);
       this.#pending.set(message.requestId, {
         expectedType,

@@ -1,4 +1,4 @@
-import { ModelIntegrityError, verifyBlobIntegrity } from './integrity';
+import { hashBlob, ModelIntegrityError, verifyBlobIntegrity } from './integrity';
 import {
   isMissingOpfsEntry, opfsDirectory, opfsOpaqueName, opfsPackagePath,
   promoteOpfsFile, removeOpfsFile, writeOpfsStream, type OpfsDirectory,
@@ -54,6 +54,17 @@ export class OpfsModelCacheBackend implements ModelCacheBlobBackend {
     try {
       await this.repository.putTemporary(temporary);
       if (options.acquire) {
+        if (offset > 0) {
+          await options.onResumeProgress?.(0, offset);
+          // Scheduling/diagnostic pass only: no trusted prefix digest exists.
+          // Never mark verifiedPrefix true; the full final digest covers it again.
+          await hashBlob((await temporaryHandle.getFile()).slice(0, offset), {
+            onProgress: async (bytes, total) => {
+              options.assertCanCommit?.();
+              await options.onResumeProgress?.(bytes, total);
+            },
+          });
+        }
         await options.acquire(temporaryHandle, offset, async (completed) => {
           if (!Number.isSafeInteger(completed) || completed < offset || completed > record.bytes) throw new Error('Invalid OPFS download checkpoint.');
           options.assertCanCommit?.();
@@ -70,7 +81,8 @@ export class OpfsModelCacheBackend implements ModelCacheBlobBackend {
       await promoteOpfsFile(temporaryHandle, finalName);
       promoted = true;
       const finalHandle = await directory.getFileHandle(finalName);
-      await verifyBlobIntegrity(await finalHandle.getFile(), { bytes: record.bytes, sha256: record.sha256 });
+      await verifyBlobIntegrity(await finalHandle.getFile(), { bytes: record.bytes, sha256: record.sha256 },
+        { onProgress: options.onCommitProgress });
       options.assertCanCommit?.();
       const complete: ModelCacheFileRecord = {
         ...record, backend: this.kind, locator: `${path}/${finalName}`, state: 'complete',

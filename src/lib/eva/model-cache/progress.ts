@@ -27,14 +27,15 @@ export class ModelCacheProgress {
   update(message: ModelCacheFileProgressMessage): boolean {
     const file = this.files.get(message.file);
     if (!file || message.totalBytes !== file.total) return false;
+    const rank = (phase: string) => ({ queued: 0, resuming: 1, 'verifying-resumed-prefix': 1,
+      downloading: 1, retrying: 1, verifying: 2, committing: 3, done: 4, serving: 4 })[phase] ?? -1;
+    // Late concurrent messages must not take a file from verifying back to download.
+    if (rank(message.phase) < rank(file.phase)) return false;
     file.received = Math.max(file.received, message.receivedBytes);
     file.verified = Math.max(file.verified, message.verifiedBytes);
-    const hashing = message.phase === 'verifying' || message.phase === 'committing';
-    const work = hashing ? file.total + message.loadedBytes
-      : message.phase === 'serving' ? file.total * 2 : message.loadedBytes;
-    const percent = file.total ? work / (2 * file.total) * 100 : 0;
-    file.percent = Math.max(file.percent, message.phase === 'serving' ? 100 : Math.min(99, percent));
-    file.phase = message.phase;
+    const percent = file.total ? Math.max(file.received, file.verified) / file.total * 100 : 0;
+    file.percent = Math.max(file.percent, percent);
+    file.phase = message.phase === 'serving' ? 'done' : message.phase;
     file.source = message.source;
     const total = [...this.files.values()].reduce((sum, entry) => sum + entry.total, 0);
     const weighted = [...this.files.values()].reduce((sum, entry) => sum + entry.total * entry.percent, 0);
@@ -46,4 +47,5 @@ export class ModelCacheProgress {
   get received(): number { return [...this.files.values()].reduce((sum, file) => sum + file.received, 0); }
   get verified(): number { return [...this.files.values()].reduce((sum, file) => sum + file.verified, 0); }
   get total(): number { return [...this.files.values()].reduce((sum, file) => sum + file.total, 0); }
+  get completeFiles(): number { return [...this.files.values()].filter(file => file.phase === 'done').length; }
 }

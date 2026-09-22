@@ -1,9 +1,20 @@
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 import { MODEL_CACHE_MAX_FILE_BYTES } from './types';
+import { ModelDigestScheduler } from './digest-scheduler';
 
-export const MODEL_CACHE_HASH_CHUNK_BYTES = 1024 * 1024;
+const digestScheduler = new ModelDigestScheduler();
+
+// Worker is not exposed in ServiceWorkerGlobalScope. Use the scheduling TDD's
+// in-thread fallback, with the owner's 4 MiB budget and an explicit task yield.
+export const MODEL_CACHE_HASH_CHUNK_BYTES = 4 * 1024 * 1024;
 export const MODEL_CACHE_MAX_HASH_CHUNK_BYTES = 8 * 1024 * 1024;
+
+export async function yieldModelDigest(): Promise<void> {
+  const scheduler = (globalThis as typeof globalThis & { scheduler?: { yield?: () => Promise<void> } }).scheduler;
+  if (scheduler?.yield) await scheduler.yield();
+  else await new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 
@@ -158,18 +169,25 @@ export async function hashBlob(
     );
   }
 
-  const accumulator = createModelSha256Accumulator(maxBytes);
-  for (let offset = 0; offset < blob.size; offset += chunkBytes) {
-    const bytes = new Uint8Array(
-      await blob.slice(offset, Math.min(offset + chunkBytes, blob.size)).arrayBuffer(),
-    );
-    if (bytes.byteLength > chunkBytes) {
-      throw new ModelIntegrityError('INVALID_CHUNK', 'Blob slice exceeded the bounded chunk size.');
+  return digestScheduler.run(blob.size, async signal => {
+    const accumulator = createModelSha256Accumulator(maxBytes);
+    for (let offset = 0; offset < blob.size; offset += chunkBytes) {
+      signal.throwIfAborted();
+      const bytes = new Uint8Array(
+        await blob.slice(offset, Math.min(offset + chunkBytes, blob.size)).arrayBuffer(),
+      );
+      signal.throwIfAborted();
+      if (bytes.byteLength > chunkBytes) {
+        throw new ModelIntegrityError('INVALID_CHUNK', 'Blob slice exceeded the bounded chunk size.');
+      }
+      accumulator.update(bytes);
+      await options.onProgress?.(accumulator.bytes, blob.size);
+      // An awaited resolved promise is only a microtask, not a heartbeat opportunity.
+      await yieldModelDigest();
     }
-    accumulator.update(bytes);
-    await options.onProgress?.(accumulator.bytes, blob.size);
-  }
-  return accumulator.digest();
+    signal.throwIfAborted();
+    return accumulator.digest();
+  });
 }
 
 export function assertModelIntegrity(
