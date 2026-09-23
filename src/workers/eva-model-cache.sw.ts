@@ -2,6 +2,7 @@
 
 import { ModelIntegrityError, verifyBlobIntegrity } from '../lib/eva/model-cache/integrity';
 import { ModelDigestTimeoutError } from '../lib/eva/model-cache/digest-scheduler';
+import { AcquisitionDiagnostics, acquisitionDiagnosticError } from '../lib/eva/model-cache/diagnostics';
 import { acquireModelChunks, RangeUnavailableError } from '../lib/eva/model-cache/acquisition';
 import { acquireWithRetry, acquisitionNetworkOperation, isAcquisitionNetworkError, AcquisitionNetworkError, DESKTOP_CHUNK_BYTES } from '../lib/eva/model-cache/resilience';
 import { writeOpfsStream } from '../lib/eva/model-cache/opfs-files';
@@ -56,6 +57,16 @@ const MAX_ARTIFACT_TRANSFERS = 2;
 const PROGRESS_INTERVAL_MS = 250;
 const MODEL_CACHE_MINIMUM_HEADROOM_BYTES = 256 * 1024 * 1024;
 const reverifyingRoots = new Map<string, string>();
+const diagnostics = new AcquisitionDiagnostics('sw');
+const renewalAcks = new Map<string, number>();
+
+function arbitrateWithDiagnostics(): void {
+  const previous = new Map([...loadLeases.values()].map(lease => [lease.nonce, lease.kind]));
+  arbitrateModelLeases(loadLeases.values());
+  for (const lease of loadLeases.values()) if (previous.get(lease.nonce) !== lease.kind) {
+    diagnostics.record({ kind: 'lease', lease: lease.nonce.slice(0, 8), code: lease.kind });
+  }
+}
 
 interface ConfiguredVersion {
   inventory: ModelCacheInventory;
@@ -214,7 +225,7 @@ async function handleDevelopmentFault(event: ExtendableMessageEvent, client: Cli
     // DEV only: mimic loss of the global, not deletion of durable bytes/metadata.
     const pending = [...artifactAcquisitions.values()].map((entry) => entry.promise);
     abortArtifactAcquisitions(() => true, 'Injected cache service restart.');
-    configuredRoots.clear(); selectedVersions.clear(); loadLeases.clear(); leaseFailures.clear(); completedLeases.clear();
+    configuredRoots.clear(); selectedVersions.clear(); loadLeases.clear(); leaseFailures.clear(); completedLeases.clear(); renewalAcks.clear();
     const previousStore = storePromise;
     developmentStateReset = (async () => {
       await Promise.allSettled(pending);
@@ -287,6 +298,7 @@ function sourceClient(event: ExtendableMessageEvent): Client | null {
 function pruneExpiredLeases(now = Date.now()): void {
   for (const [nonce, lease] of loadLeases) {
     if (isModelCacheLoadLeaseExpired(lease, now)) {
+      diagnostics.record({ kind: 'lease', lease: nonce.slice(0, 8), code: 'expired' });
       loadLeases.delete(nonce);
       releaseLeaseFromArtifactAcquisitions(nonce, 'The explicit Eva model load lease expired.');
       void getStore().then((store) => store?.endVerificationScope(nonce));
@@ -296,9 +308,11 @@ function pruneExpiredLeases(now = Date.now()): void {
 }
 
 function releaseLeaseFromArtifactAcquisitions(nonce: string, reason: string): void {
+  renewalAcks.delete(nonce);
+  diagnostics.record({ kind: 'lease', lease: nonce.slice(0, 8), code: 'released' });
   leaseFailures.delete(nonce);
   completedLeases.delete(nonce);
-  arbitrateModelLeases(loadLeases.values());
+  arbitrateWithDiagnostics();
   for (const acquisition of artifactAcquisitions.values()) {
     if (acquisition.leaseNonces.delete(nonce)
       && acquisition.leaseNonces.size === 0
@@ -317,6 +331,7 @@ async function acquisitionActivity(context: ArtifactAcquisitionContext): Promise
     const clients = new Set((await self.clients.matchAll({ type: 'window', includeUncontrolled: true })).map(client => client.id));
     for (const [nonce, lease] of loadLeases) {
       if (!clients.has(lease.pageClientId)) {
+        diagnostics.record({ kind: 'lease', lease: nonce.slice(0, 8), code: 'page-closed' });
         loadLeases.delete(nonce);
         releaseLeaseFromArtifactAcquisitions(nonce, 'Acquiring page closed.');
       }
@@ -385,7 +400,9 @@ function liveAcquisitionLeases(context: ArtifactAcquisitionContext): ModelCacheL
       context.leaseNonces.delete(nonce);
       if (lease && isModelCacheLoadLeaseExpired(lease, now)) {
         loadLeases.delete(nonce);
-        arbitrateModelLeases(loadLeases.values());
+        renewalAcks.delete(nonce);
+        diagnostics.record({ kind: 'lease', lease: nonce.slice(0, 8), code: 'expired' });
+        arbitrateWithDiagnostics();
         void getStore().then((store) => store?.endVerificationScope(nonce));
       }
       continue;
@@ -525,6 +542,7 @@ function postRpcResponse(
 }
 
 async function postToClient(clientId: string, message: ModelCacheWorkerMessage): Promise<void> {
+  diagnostics.observe(message);
   const client = await self.clients.get(clientId);
   client?.postMessage(message);
 }
@@ -635,6 +653,7 @@ function replyError(
     message: text,
     recoverable: true,
   };
+  diagnostics.observe(response);
   postRpcResponse(event, client, response);
 }
 
@@ -733,6 +752,17 @@ async function handleClientMessage(event: ExtendableMessageEvent): Promise<void>
   const { message } = bound;
   const key = modelRootKey(message.modelOrigin, message.modelRootPath);
 
+  // Read-only and usable even after SW global loss. No CONFIGURE, storage,
+  // pruning, lease renewal, or network access is allowed on the copy path.
+  if (message.type === 'GET_DIAGNOSTICS') {
+    if (client.type !== 'window' || new URL(client.url).origin !== self.location.origin) return;
+    postRpcResponse(event, client, {
+      ...workerMessageBase(client.id, message, message.manifestVersion, message.requestId),
+      type: 'DIAGNOSTICS', snapshot: diagnostics.snapshot(),
+      activeLeases: loadLeases.size, activeTransfers: artifactAcquisitions.size,
+    } satisfies ModelCacheWorkerMessage);
+    return;
+  }
   if (message.type === 'CONFIGURE') {
     try {
       const root = await configureRoot(bound, client);
@@ -839,7 +869,8 @@ async function handleClientMessage(event: ExtendableMessageEvent): Promise<void>
     lease.chunkBytes = message.chunkBytes;
     if (loadLeases.size === 0) transferSemaphore.setLimit(message.concurrency ?? 2);
     loadLeases.set(lease.nonce, lease);
-    arbitrateModelLeases(loadLeases.values());
+    arbitrateWithDiagnostics();
+    diagnostics.record({ kind: 'lease', lease: lease.nonce.slice(0, 8), code: lease.kind });
     for (const acquisition of artifactAcquisitions.values()) {
       if (!lease.diskOnly && sameLeasePackage(lease, acquisition) && !acquisition.controller.signal.aborted) {
         acquisition.leaseNonces.add(lease.nonce);
@@ -860,6 +891,7 @@ async function handleClientMessage(event: ExtendableMessageEvent): Promise<void>
       loadLeases.set(message.nonce, result.lease);
       root.clientIds.add(client.id);
     }
+    diagnostics.record({ kind: 'lease', lease: message.nonce.slice(0, 8), code: result.ok ? 'claimed' : result.reason });
     postRpcResponse(event, client, result.ok ? { ok: true } : { ok: false, reason: result.reason });
     return;
   }
@@ -874,6 +906,11 @@ async function handleClientMessage(event: ExtendableMessageEvent): Promise<void>
       return;
     }
     loadLeases.set(message.nonce, result.lease);
+    const acknowledgedAt = Date.now();
+    const previousAck = renewalAcks.get(message.nonce);
+    renewalAcks.set(message.nonce, acknowledgedAt);
+    diagnostics.record({ kind: 'heartbeat-ack', lease: message.nonce.slice(0, 8),
+      ...(previousAck === undefined ? {} : { gapMs: Math.max(0, acknowledgedAt - previousAck) }) });
     // Liveness only: deliberately no store lookup or storage.estimate roundtrip.
     postRpcResponse(event, client, {
       ...workerMessageBase(client.id, root, message.manifestVersion, message.requestId),
@@ -894,6 +931,7 @@ async function handleClientMessage(event: ExtendableMessageEvent): Promise<void>
     }
     const ending = [...artifactAcquisitions.values()].filter((entry) => entry.leaseNonces.has(message.nonce) && entry.leaseNonces.size === 1).map((entry) => entry.promise);
     loadLeases.delete(message.nonce);
+    diagnostics.record({ kind: 'lease', lease: message.nonce.slice(0, 8), code: message.type === 'END_LOAD' ? 'ended' : 'cancelled' });
     releaseLeaseFromArtifactAcquisitions(
       message.nonce,
       `The Eva model transfer was ${message.type === 'END_LOAD' ? 'ended' : 'cancelled'}.`,
@@ -917,6 +955,7 @@ async function handleClientMessage(event: ExtendableMessageEvent): Promise<void>
       for (const [nonce, lease] of loadLeases) {
         if (lease.modelOrigin === root.modelOrigin && lease.modelRootPath === root.modelRootPath) {
           loadLeases.delete(nonce);
+          renewalAcks.delete(nonce);
           store.endVerificationScope(nonce);
         }
       }
@@ -1197,6 +1236,7 @@ async function fetchFullArtifact(
   file: ModelCachePresentManifestFile,
   acquisition: ArtifactAcquisitionContext,
 ): Promise<Response> {
+  diagnostics.record({ kind: 'full-fetch', file: file.path, total: file.bytes });
   const response = await acquisitionNetworkOperation(() => fetch(url, {
     method: 'GET',
     mode: 'cors',
@@ -1501,8 +1541,10 @@ async function acquireArtifact(
               },
               fetch: async (start, end) => {
                 requireLiveAcquisitionLease(acquisitionContext);
+                diagnostics.record({ kind: 'range', file: file.path, start, end, total: file.bytes });
                 const result = await fetch(matched.route.url, { mode: 'cors', credentials: 'omit', redirect: 'error', cache: 'no-store',
                   signal: acquisitionContext.controller.signal, headers: { Accept: file.contentType, Range: `bytes=${start}-${end}` } });
+                diagnostics.record({ kind: 'range-response', file: file.path, start, end, status: result.status });
                 if (result.type === 'opaque' || (result.url && result.url !== matched.route.url)) {
                   await result.body?.cancel();
                   throw new Error('Unusable range origin or response.');
@@ -1591,6 +1633,7 @@ async function acquireArtifact(
     await packageComplete(matched.root, inventory.manifestIdentity.manifestVersion);
     return result;
   }).catch(async (error: unknown) => {
+    diagnostics.record({ kind: 'error', file: file.path, code: acquisitionDiagnosticError(error) });
     if (!controller.signal.aborted) {
       for (const nonce of acquisitionContext.leaseNonces) {
         const failures = leaseFailures.get(nonce) ?? new Map<string, unknown>();

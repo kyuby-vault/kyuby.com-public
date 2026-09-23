@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { run } from './invoke.mjs';
@@ -6,6 +6,38 @@ import { createCiMonitor } from './ci-status.mjs';
 export { assertCiRun } from './ci-status.mjs';
 
 const mirror = 'kyuby-vault/kyuby.com-public';
+// Nonsecret account mapping from the original local mint protocol. That vault
+// format stored name/id/secret/expiry only. New records may supply account_id.
+const legacyPublishAccount = '0f289426cecc5865f1f83a1f1e9c3a4e';
+export function resolvePagesEnvironment(env = process.env, root = process.cwd(), now = Date.now()) {
+  const names = ['CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID'];
+  if (names.every(name => env[name]?.trim())) return { ...env }; // CI never opens the vault.
+  assertHost(env);
+  let record;
+  try {
+    const path = resolve(root, '.credentials/cloudflare-sub-tokens.json');
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 64 * 1024) throw new Error();
+    record = JSON.parse(readFileSync(path, 'utf8')).publish_static;
+    if (record?.name !== 'kyuby-publish-static') throw new Error();
+  } catch {
+    throw new Error('Pages credentials unavailable: set scoped environment variables or restore the kyuby-publish-static vault record.');
+  }
+  const resolved = { ...env };
+  if (!env.CLOUDFLARE_API_TOKEN?.trim()) {
+    if (typeof record.secret !== 'string' || !/^[A-Za-z0-9_-]{20,1024}$/.test(record.secret)
+      || typeof record.expires_on !== 'string' || !Number.isFinite(Date.parse(record.expires_on)) || Date.parse(record.expires_on) <= now) {
+      throw new Error('The kyuby-publish-static vault credential is invalid or expired; renew it on the host.');
+    }
+    resolved.CLOUDFLARE_API_TOKEN = record.secret;
+  }
+  if (!env.CLOUDFLARE_ACCOUNT_ID?.trim()) {
+    const account = record.account_id ?? legacyPublishAccount;
+    if (typeof account !== 'string' || !/^[a-f0-9]{32}$/i.test(account)) throw new Error('The publish vault account_id is invalid.');
+    resolved.CLOUDFLARE_ACCOUNT_ID = account;
+  }
+  return resolved; // Child env only: never mutate process.env, print, or return in argv.
+}
 export function hostBash() {
   if (process.platform !== 'win32') return 'bash';
   // Windows' bash.exe may launch WSL. Resolve Git Bash from the installed Git
@@ -31,6 +63,11 @@ export function mintReady(path) {
 }
 export async function main(command, env = process.env) {
   assertHost(env);
+  if (command === 'deploy-preview') {
+    const { main: invoke } = await import('./invoke.mjs');
+    invoke(command, env);
+    return;
+  }
   if (command === 'mint-keys-renew') {
     mintReady('.credentials/master.txt');
     run(process.execPath, ['.credentials/cloudflare-mint.mjs', '--mint']);

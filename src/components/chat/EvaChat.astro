@@ -232,6 +232,7 @@
         </label>
       </div>
       <div class="runtime-actions">
+        <button class="text-button" id="copy-acquisition-diagnostics" type="button">Copy acquisition diagnostics</button>
         <button class="text-button" id="reverify-model" type="button" disabled>Re-verify now</button>
         <button class="text-button text-button--danger" id="remove-local-model" type="button" disabled>
           <i data-lucide="trash-2"></i>
@@ -242,6 +243,8 @@
           Clear conversations, memory, and profile
         </button>
       </div>
+      <p id="acquisition-diagnostics-status" role="status"></p>
+      <p class="runtime-action-note">Diagnostics stay in bounded memory only. Copy includes recent download events and current state, never conversations. Nothing is uploaded; history resets when the page or cache service restarts.</p>
       <p id="cache-progress-summary" role="status"></p>
       <label for="download-concurrency">Concurrent model transfers (next explicit load)</label>
       <select id="download-concurrency"><option value="2">2 (default)</option><option value="4">4</option></select>

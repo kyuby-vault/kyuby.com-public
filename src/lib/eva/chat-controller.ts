@@ -93,6 +93,7 @@ import type {
 } from './model-cache/types';
 import { createModelCacheRootPath } from './model-cache/routing';
 import { ModelCacheProgress } from './model-cache/progress';
+import { acquisitionDiagnosticError, acquisitionDiagnosticsJson, copyAcquisitionDiagnostics } from './model-cache/diagnostics';
 import { AcquisitionWakeLock } from './model-cache/wake-lock';
 import { ACQUISITION_NOTICES, acquisitionCapacity, acquisitionDevicePolicy, acquisitionFailureCode, terminateFailedLoad,
   type AcquisitionCapacity, type AcquisitionNoticeCode } from './model-cache/resilience';
@@ -574,6 +575,8 @@ export async function mountEvaChat(): Promise<void> {
   let persistenceDenied = false;
   let experimentalUi = globalThis.localStorage.getItem(EXPERIMENTAL_UI_KEY) === 'on';
   const cacheClient = new EvaModelCacheClient();
+  const copyDiagnosticsButton = requiredElement<HTMLButtonElement>('copy-acquisition-diagnostics');
+  const diagnosticsStatus = requiredElement<HTMLElement>('acquisition-diagnostics-status');
   let cacheConfigured = false;
   let cacheLoadNonce: string | null = null;
   let cacheLeaseHeartbeatNonce: string | null = null;
@@ -599,7 +602,7 @@ export async function mountEvaChat(): Promise<void> {
       visibilityHint.hidden = false;
       visibilityHint.textContent = 'Screen wake lock is unavailable. Keep this tab visible while downloading; you can resume after an interruption.';
     }
-  });
+  }, navigator, document, code => cacheClient.diagnostics.record({ kind: 'wake-lock', code }));
 
   function acquisitionNotice(code: AcquisitionNoticeCode): void {
     runtimeNotice.dataset.acquisition = code;
@@ -607,6 +610,7 @@ export async function mountEvaChat(): Promise<void> {
   }
 
   function acquisitionDiagnostic(error: unknown): void {
+    cacheClient.diagnostics.record({ kind: 'error', code: acquisitionDiagnosticError(error) });
     const text = error instanceof Error ? error.message : String(error);
     liveStatus.textContent = text.slice(0, 2048);
     console.warn('Eva acquisition diagnostic:', text.slice(0, 2048));
@@ -1121,6 +1125,10 @@ export async function mountEvaChat(): Promise<void> {
     browserStorage = await inspectBrowserStorage();
     capacity = acquisitionCapacity(cacheStatus?.totalBytes ?? modelConfig?.manifest.cacheInventory?.totalBytes ?? 0,
       cacheStatus?.cachedBytes ?? 0, browserStorage.estimate);
+    cacheClient.diagnostics.record({ kind: 'preflight', code: capacity,
+      total: cacheStatus?.totalBytes ?? modelConfig?.manifest.cacheInventory?.totalBytes ?? 0,
+      ...(browserStorage.estimate.usage === null ? {} : { usage: browserStorage.estimate.usage }),
+      ...(browserStorage.estimate.quota === null ? {} : { quota: browserStorage.estimate.quota }) });
     capacityLabel.dataset.state = capacity;
     capacityLabel.textContent = capacity === 'ok' ? 'OK · space available'
       : capacity === 'tight' ? 'Tight · may need cleanup; the browser estimate is limited'
@@ -2325,6 +2333,30 @@ export async function mountEvaChat(): Promise<void> {
     });
   });
   removeModelButton.addEventListener('click', showRemoveModelDialog);
+  copyDiagnosticsButton.addEventListener('click', () => {
+    copyDiagnosticsButton.disabled = true;
+    diagnosticsStatus.textContent = 'Preparing local diagnostics…';
+    void copyAcquisitionDiagnostics(async () => {
+      let worker = null as Awaited<ReturnType<typeof cacheClient.getDiagnostics>>;
+      let workerError: string | null = null;
+      try { worker = await cacheClient.getDiagnostics(); }
+      catch (error) { workerError = acquisitionDiagnosticError(error); }
+      return acquisitionDiagnosticsJson(worker?.snapshot ?? null, cacheClient.diagnostics.snapshot(), {
+        workerAvailable: worker !== null, workerError,
+        activeLeases: worker?.activeLeases ?? null, activeTransfers: worker?.activeTransfers ?? null,
+        session: uiState.session, residency: uiState.residency, source: uiState.loadSource,
+        manifestVersion: modelConfig?.manifestVersion ?? null,
+        capacity, cacheBackend: cacheStatus?.backend ?? null, integrity: cacheStatus?.integrity ?? null,
+        warning: uiState.warning?.code ?? null, storage: browserStorage,
+        sharedAcquisition, explicitLeaseActive: cacheLoadNonce !== null,
+        cacheServiceRestarts: cacheClient.restarts, wakeLock: acquisitionWakeLock.state,
+        acquisitionPolicy: devicePolicy(),
+        progress: { percent: cacheProgress.percent, files: [...cacheProgress.files.values()] },
+      });
+    }).then(() => { diagnosticsStatus.textContent = 'Acquisition diagnostics copied. Nothing uploaded.'; })
+      .catch(() => { diagnosticsStatus.textContent = 'Could not copy diagnostics. Allow clipboard access on this HTTPS page and try again. Nothing uploaded.'; })
+      .finally(() => { copyDiagnosticsButton.disabled = false; });
+  });
   confirmRemoveModelButton.addEventListener('click', () => void removeModelFromDevice());
   clearDataButton.addEventListener('click', () => clearDialog.showModal());
   confirmClearButton.addEventListener('click', () => {

@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { resolve, join, relative, isAbsolute } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { resolvePagesEnvironment } from './host.mjs';
 
 export const readOnly = ['src', 'public', 'tests', 'integrations', 'docs', 'package.json', 'package-lock.json',
   '.nvmrc', 'tsconfig.json', 'astro.config.mjs', 'playwright.config.ts', 'vitest.config.ts', 'wrangler.jsonc', 'scripts',
@@ -107,16 +108,17 @@ export function main(target, env = process.env) {
     return;
   }
   if (target === 'deploy-preview') {
-    for (const name of ['CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID']) if (!env[name]?.trim()) throw new Error(`Missing ${name}.`);
+    const credentials = resolvePagesEnvironment(env, root);
     const branch = previewBranch(run('git', ['branch', '--show-current'], { capture: true }));
     const sha = run('git', ['rev-parse', 'HEAD'], { capture: true });
     const dirty = run('git', ['status', '--porcelain'], { capture: true }) !== '';
     run(engine, containerArgs(root, 'build', env));
     run(engine, containerArgs(root, 'dry-run', env));
-    const deployEnv = { ...env, PREVIEW_BRANCH: branch, DEPLOY_SHA: sha, DEPLOY_DIRTY: String(dirty) };
+    const deployEnv = { ...credentials, PREVIEW_BRANCH: branch, DEPLOY_SHA: sha, DEPLOY_DIRTY: String(dirty) };
     run(engine, containerArgs(root, 'upload-preview', deployEnv), { env: deployEnv });
     return;
   }
+  if (target === 'upload-preview' || target === 'upload-prod') env = resolvePagesEnvironment(env, root);
   run(engine, containerArgs(root, target, env), { env });
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

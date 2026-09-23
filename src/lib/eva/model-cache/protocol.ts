@@ -15,6 +15,7 @@ import {
   isCanonicalModelCacheRootPath,
   normalizeModelCacheOrigin,
 } from './routing';
+import { DIAGNOSTIC_LIMITS, isAcquisitionDiagnosticSnapshot, type AcquisitionDiagnosticSnapshot } from './diagnostics';
 
 export const MODEL_CACHE_PROTOCOL_VERSION = 1 as const;
 export const MODEL_CACHE_MAX_MESSAGE_BYTES = 64 * 1024;
@@ -80,7 +81,7 @@ export interface ModelCacheConfigureMessage extends ModelCacheClientMessageBase 
 }
 
 export interface ModelCacheGetStatusMessage extends ModelCacheClientMessageBase {
-  type: 'GET_STATUS';
+  type: 'GET_STATUS' | 'GET_DIAGNOSTICS';
 }
 
 export interface ModelCacheReverifyMessage extends ModelCacheClientMessageBase {
@@ -148,6 +149,13 @@ interface ModelCacheWorkerMessageBase {
 export interface ModelCacheStatusMessage extends ModelCacheWorkerMessageBase {
   type: 'STATUS';
   status: ModelCacheStatus;
+}
+
+export interface ModelCacheDiagnosticsMessage extends ModelCacheWorkerMessageBase {
+  type: 'DIAGNOSTICS';
+  snapshot: AcquisitionDiagnosticSnapshot;
+  activeLeases: number;
+  activeTransfers: number;
 }
 
 export interface ModelCacheRenewAck extends ModelCacheWorkerMessageBase {
@@ -227,6 +235,7 @@ export interface ModelCacheErrorMessage extends ModelCacheWorkerMessageBase {
 
 export type ModelCacheWorkerMessage =
   | ModelCacheStatusMessage
+  | ModelCacheDiagnosticsMessage
   | ModelCacheRenewAck
   | ModelCacheLeaseState
   | ModelCachePackageComplete
@@ -309,10 +318,10 @@ function isNonce(value: unknown): value is string {
     && NONCE_PATTERN.test(value);
 }
 
-function isMessageWithinBound(value: unknown): boolean {
+function isMessageWithinBound(value: unknown, maximum = MODEL_CACHE_MAX_MESSAGE_BYTES): boolean {
   try {
     const encoded = textEncoder.encode(JSON.stringify(value));
-    return encoded.byteLength <= MODEL_CACHE_MAX_MESSAGE_BYTES;
+    return encoded.byteLength <= maximum;
   } catch {
     return false;
   }
@@ -481,6 +490,7 @@ export function isModelCacheClientMessage(value: unknown): value is ModelCacheCl
     }
     case 'REVERIFY':
     case 'GET_STATUS':
+    case 'GET_DIAGNOSTICS':
       return (value.type !== 'REVERIFY' || isManifestVersion(value.manifestVersion)) && hasExactKeys(value, [
         'protocolVersion',
         'type',
@@ -549,7 +559,8 @@ function workerMessageMatchesBase(
 }
 
 export function isModelCacheWorkerMessage(value: unknown): value is ModelCacheWorkerMessage {
-  if (!isRecord(value) || !isMessageWithinBound(value) || !isWorkerBase(value)) {
+  if (!isRecord(value) || !isMessageWithinBound(value,
+    value.type === 'DIAGNOSTICS' ? DIAGNOSTIC_LIMITS.sw.bytes + 4096 : MODEL_CACHE_MAX_MESSAGE_BYTES) || !isWorkerBase(value)) {
     return false;
   }
   const base = [
@@ -562,6 +573,11 @@ export function isModelCacheWorkerMessage(value: unknown): value is ModelCacheWo
     'manifestVersion',
   ];
   switch (value.type) {
+    case 'DIAGNOSTICS':
+      return hasExactKeys(value, [...base, 'snapshot', 'activeLeases', 'activeTransfers'])
+        && isAcquisitionDiagnosticSnapshot(value.snapshot, 'sw')
+        && isSafeIntegerInRange(value.activeLeases, 8)
+        && isSafeIntegerInRange(value.activeTransfers, Number.MAX_SAFE_INTEGER);
     case 'VERIFY_RESULT':
       return hasExactKeys(value, [...base, 'files', 'status'])
         && isManifestVersion(value.manifestVersion)

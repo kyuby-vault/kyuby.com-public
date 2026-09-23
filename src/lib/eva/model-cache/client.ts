@@ -5,6 +5,7 @@ import type {
   ModelCacheStorageEstimate,
   ModelCacheWarning,
 } from './types';
+import { AcquisitionDiagnostics, acquisitionDiagnosticError } from './diagnostics';
 import {
   MODEL_CACHE_PROTOCOL_VERSION,
   MODEL_CACHE_LOAD_LEASE_ABSOLUTE_MS,
@@ -43,6 +44,7 @@ interface PendingRpc {
   reject: (error: Error) => void;
   timeout: ReturnType<typeof globalThis.setTimeout>;
   port: MessagePort;
+  startedAt: number;
 }
 
 export interface ModelCacheClientAvailability {
@@ -110,6 +112,7 @@ async function waitForReadyRegistration(container: ServiceWorkerContainer): Prom
  * top of this lifecycle so callers can fail closed to a normal network load.
  */
 export class EvaModelCacheClient extends EventTarget {
+  readonly diagnostics = new AcquisitionDiagnostics('page');
   #availability: ModelCacheClientAvailability = {
     available: false,
     warning: null,
@@ -189,6 +192,12 @@ export class EvaModelCacheClient extends EventTarget {
       type: 'GET_STATUS',
     }, 'STATUS');
     return response.status;
+  }
+
+  /** Snapshot only: never initialize, CONFIGURE, recover, renew a lease or touch disk. */
+  async getDiagnostics(): Promise<Extract<ModelCacheWorkerMessage, { type: 'DIAGNOSTICS' }> | null> {
+    if (!this.#root || !this.#controller) return null;
+    return this.#send({ ...this.#baseMessage(this.#manifestVersion), type: 'GET_DIAGNOSTICS' }, 'DIAGNOSTICS', 3_000);
   }
 
   async beginLoad(diskOnly = false, concurrency: 2 | 4 = 2, chunkBytes?: number): Promise<string> {
@@ -360,6 +369,7 @@ export class EvaModelCacheClient extends EventTarget {
     const channel = new MessageChannel();
     const completion = new Promise<ModelCacheWorkerMessage>((resolve, reject) => {
       const timeout = globalThis.setTimeout(() => {
+        if (message.type !== 'GET_DIAGNOSTICS') this.diagnostics.record({ kind: 'error', code: 'RPC_TIMEOUT' });
         this.#pending.delete(message.requestId);
         channel.port1.close();
         reject(new ModelCacheRpcError('RPC_TIMEOUT', `Eva model cache ${message.type} request timed out.`));
@@ -370,6 +380,7 @@ export class EvaModelCacheClient extends EventTarget {
         reject,
         timeout,
         port: channel.port1,
+        startedAt: performance.now(),
       });
       channel.port1.addEventListener('message', this.#handlePortMessage);
       channel.port1.start();
@@ -402,6 +413,7 @@ export class EvaModelCacheClient extends EventTarget {
     }
 
     if (value.type === 'ERROR') {
+      this.diagnostics.observe(value);
       this.#settleRpcError(value.requestId, new ModelCacheRpcError(value.code, value.message));
       return;
     }
@@ -417,6 +429,8 @@ export class EvaModelCacheClient extends EventTarget {
     if (value.type !== pending.expectedType) {
       return;
     }
+    if (value.type === 'RENEW_ACK') this.diagnostics.record({ kind: 'heartbeat-ack', lease: value.nonce.slice(0, 8),
+      elapsedMs: Math.max(0, performance.now() - pending.startedAt) });
     globalThis.clearTimeout(pending.timeout);
     pending.port.close();
     this.#pending.delete(value.requestId);
@@ -428,6 +442,7 @@ export class EvaModelCacheClient extends EventTarget {
     if (!pending) {
       return;
     }
+    if (pending.expectedType !== 'DIAGNOSTICS') this.diagnostics.record({ kind: 'error', code: acquisitionDiagnosticError(error) });
     globalThis.clearTimeout(pending.timeout);
     pending.port.close();
     this.#pending.delete(requestId);
