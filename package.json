@@ -4,7 +4,7 @@
   "version": "0.0.1",
   "private": true,
   "engines": {
-    "node": "22.x"
+    "node": "26.x"
   },
   "scripts": {
     "dev": "astro dev",
@@ -17,24 +17,24 @@
     "astro": "astro"
   },
   "dependencies": {
-    "@electric-sql/pglite": "0.5.8",
-    "@huggingface/transformers": "4.2.0",
-    "@noble/hashes": "2.3.0",
-    "astro": "^5.5.5",
-    "idb": "8.0.3",
-    "lucide": "1.33.0",
-    "memfs": "4.75.0",
+    "@electric-sql/pglite": "^0.5.8",
+    "@huggingface/transformers": "^4.3.0",
+    "@noble/hashes": "^2.4.0",
+    "astro": "^7.3.4",
+    "idb": "^8.0.3",
+    "lucide": "^1.47.0",
+    "memfs": "^4.79.0",
     "rss-parser": "^3.13.0"
   },
   "devDependencies": {
-    "@astrojs/check": "0.9.10",
-    "@playwright/test": "1.62.1",
-    "esbuild": "0.27.4",
-    "fake-indexeddb": "6.2.5",
-    "typescript": "5.9.3",
-    "vite-plugin-node-polyfills": "0.28.0",
-    "vitest": "4.1.11",
-    "wrangler": "4.125.0",
-    "yaml": "2.9.0"
+    "@astrojs/check": "^0.9.10",
+    "@playwright/test": "^1.62.1",
+    "esbuild": "^0.28.0",
+    "fake-indexeddb": "^6.2.5",
+    "typescript": "^5.9.3",
+    "vite-plugin-node-polyfills": "^0.28.0",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.136.3",
+    "yaml": "^2.9.0"
   }
 }

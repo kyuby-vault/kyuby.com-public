@@ -1,27 +1,43 @@
 import { defineConfig } from 'astro/config';
-import { nodePolyfills } from 'vite-plugin-node-polyfills';
+import { createRequire } from 'node:module';
+import inject from '@rollup/plugin-inject';
 import evaModelCacheServiceWorker from './integrations/eva-model-cache-sw.mjs';
 
-// memfs imports node: built-ins explicitly. Polyfill both dev dependencies and
-// production Workers, without granting fs/network access or changing inference code.
-const sandboxPolyfills = () => nodePolyfills({
-  include: ['buffer', 'events', 'path', 'stream', 'url'],
-  globals: { Buffer: true, global: true, process: true },
-  protocolImports: true,
-}).flat(Infinity).map((plugin) => {
-  if (plugin.name !== 'vite-plugin-node-polyfills') return plugin;
-  return {
-    ...plugin,
-    config(...args) {
-      const config = plugin.config.call(this, ...args);
-      // Match built-ins exactly. A prefix alias for stream would also rewrite
-      // PGlite's Node-only stream/promises import into a nonexistent browser file.
-      config.resolve.alias = Object.entries(config.resolve.alias).map(([name, replacement]) => ({
-        find: new RegExp(`^${name}$`), replacement,
-      }));
-      return config;
-    },
-  };
+const require = createRequire(import.meta.url);
+
+const polyfillMap = {
+  'buffer': require.resolve('buffer/'),
+  'node:buffer': require.resolve('buffer/'),
+  'path': require.resolve('path-browserify'),
+  'node:path': require.resolve('path-browserify'),
+  'events': require.resolve('events/'),
+  'node:events': require.resolve('events/'),
+  'stream': require.resolve('stream-browserify'),
+  'node:stream': require.resolve('stream-browserify'),
+  'url': require.resolve('url/'),
+  'node:url': require.resolve('url/'),
+  'process': require.resolve('process/browser.js'),
+  'node:process': require.resolve('process/browser.js'),
+};
+
+const rolldownNodePolyfills = () => ({
+  name: 'rolldown-node-polyfills',
+  resolveId(id) {
+    if (id in polyfillMap) return polyfillMap[id];
+    return null;
+  },
+});
+
+const clientNodePolyfills = () => ({
+  name: 'client-node-polyfills',
+  enforce: 'pre',
+  resolveId(id, _importer, options) {
+    const isServer = Boolean(options?.ssr || (this.environment && this.environment.name !== 'client'));
+    if (!isServer && id in polyfillMap) {
+      return polyfillMap[id];
+    }
+    return null;
+  },
 });
 
 // https://astro.build/config
@@ -29,13 +45,22 @@ export default defineConfig({
   site: 'https://kyuby.com',
   integrations: [evaModelCacheServiceWorker()],
   vite: {
-    plugins: [sandboxPolyfills()],
-    worker: { plugins: () => [sandboxPolyfills()] },
+    plugins: [clientNodePolyfills()],
+    worker: {
+      plugins: () => [
+        clientNodePolyfills(),
+        inject({
+          Buffer: ['buffer', 'Buffer'],
+          process: 'process',
+        }),
+      ],
+    },
     optimizeDeps: {
-      // Prebundle stream too: PGlite's late Node-only import would otherwise
-      // discover the polyfill mid-conversation and force a dev-server page reload.
-      include: ['@huggingface/transformers', 'memfs', 'stream'],
+      include: ['@huggingface/transformers', 'memfs'],
       exclude: ['@electric-sql/pglite'],
+      rolldownOptions: {
+        plugins: [rolldownNodePolyfills()],
+      },
     },
   },
   devToolbar: {

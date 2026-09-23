@@ -1,4 +1,6 @@
 import { build, context } from 'esbuild';
+import { existsSync, readdirSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const SERVICE_WORKER_PATH = '/eva-model-cache-sw.js';
@@ -83,6 +85,18 @@ export default function evaModelCacheServiceWorker() {
           sourcemap: false,
           write: true,
         });
+
+        // Cloudflare Workers Static Assets caps asset sizes at 25 MiB.
+        // ONNX runtime wasm fallback binaries exceed this cap and are owned
+        // by models.kyuby.com / external CDN per runtime ownership policy.
+        const astroDir = fileURLToPath(new URL('./_astro', dir));
+        if (existsSync(astroDir)) {
+          for (const file of readdirSync(astroDir)) {
+            if (file.startsWith('ort-wasm') && file.endsWith('.wasm')) {
+              rmSync(join(astroDir, file), { force: true });
+            }
+          }
+        }
       },
     },
   };

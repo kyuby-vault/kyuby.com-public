@@ -1,10 +1,12 @@
-# Node 22.x: Cloudflare Pages build compatibility without freezing patch updates.
+# Node 26.x: Cloudflare Pages build compatibility without freezing patch updates.
 # Each rebuilt image is validated by the smoke checks and full DevPod gates.
-FROM docker.io/library/node:22-bookworm-slim
+FROM docker.io/library/node:26-bookworm-slim
 LABEL com.kyuby.devpod="true"
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
     WRANGLER_SEND_METRICS=false ASTRO_TELEMETRY_DISABLED=1 \
-    NPM_CONFIG_CACHE=/opt/npm-cache KYUBY_DEVPOD=1
+    NPM_CONFIG_CACHE=/opt/npm-cache KYUBY_DEVPOD=1 \
+    TZ=UTC
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 RUN apt-get update && apt-get install -y --no-install-recommends git bash curl jq ca-certificates make \
     && rm -rf /var/lib/apt/lists/*
 RUN groupadd --gid 1001 appuser && useradd --uid 1001 --gid 1001 --create-home appuser
@@ -27,6 +29,6 @@ USER appuser
 ENTRYPOINT ["bash", "/opt/kyuby-devpod/entrypoint.sh"]
 CMD ["make", "-C", "/workspace", "gates"]
 # Build-ending smoke gate: Node major only; Playwright/Wrangler stay exact and lockfile-owned.
-RUN test "$(node -p 'process.versions.node.split(".")[0]')" = 22 \
-    && test "$(npx --no-install playwright --version)" = "Version $(node -p 'require("./package.json").devDependencies["@playwright/test"]')" \
+RUN test "$(node -p 'process.versions.node.split(".")[0]')" = "$(cut -d. -f1 .nvmrc)" \
+    && test "$(npx --no-install playwright --version)" = "Version $(node -p 'require("./package-lock.json").packages["node_modules/@playwright/test"].version')" \
     && test "$(npx --no-install wrangler --version)" = "$(node -p 'require("./package-lock.json").packages["node_modules/wrangler"].version')"
