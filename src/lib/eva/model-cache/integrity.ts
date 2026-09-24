@@ -161,7 +161,7 @@ export async function hashBlob(
   if (!(blob instanceof Blob)) {
     throw new ModelIntegrityError('INVALID_CHUNK', 'Model content must be a Blob.');
   }
-  const { chunkBytes, maxBytes } = normalizeHashOptions(options);
+  const { maxBytes } = normalizeHashOptions(options);
   if (blob.size > maxBytes) {
     throw new ModelIntegrityError(
       'LIMIT_EXCEEDED',
@@ -169,25 +169,8 @@ export async function hashBlob(
     );
   }
 
-  return digestScheduler.run(blob.size, async signal => {
-    const accumulator = createModelSha256Accumulator(maxBytes);
-    for (let offset = 0; offset < blob.size; offset += chunkBytes) {
-      signal.throwIfAborted();
-      const bytes = new Uint8Array(
-        await blob.slice(offset, Math.min(offset + chunkBytes, blob.size)).arrayBuffer(),
-      );
-      signal.throwIfAborted();
-      if (bytes.byteLength > chunkBytes) {
-        throw new ModelIntegrityError('INVALID_CHUNK', 'Blob slice exceeded the bounded chunk size.');
-      }
-      accumulator.update(bytes);
-      await options.onProgress?.(accumulator.bytes, blob.size);
-      // An awaited resolved promise is only a microtask, not a heartbeat opportunity.
-      await yieldModelDigest();
-    }
-    signal.throwIfAborted();
-    return accumulator.digest();
-  });
+  const buffer = await blob.arrayBuffer();
+  return digestScheduler.digestBuffer(buffer, undefined, options.onProgress);
 }
 
 export function assertModelIntegrity(

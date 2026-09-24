@@ -1,4 +1,4 @@
-import { hashBlob, ModelIntegrityError, verifyBlobIntegrity } from './integrity';
+import { ModelIntegrityError, verifyBlobIntegrity } from './integrity';
 import {
   isMissingOpfsEntry, opfsDirectory, opfsOpaqueName, opfsPackagePath,
   promoteOpfsFile, removeOpfsFile, writeOpfsStream, type OpfsDirectory,
@@ -56,14 +56,6 @@ export class OpfsModelCacheBackend implements ModelCacheBlobBackend {
       if (options.acquire) {
         if (offset > 0) {
           await options.onResumeProgress?.(0, offset);
-          // Scheduling/diagnostic pass only: no trusted prefix digest exists.
-          // Never mark verifiedPrefix true; the full final digest covers it again.
-          await hashBlob((await temporaryHandle.getFile()).slice(0, offset), {
-            onProgress: async (bytes, total) => {
-              options.assertCanCommit?.();
-              await options.onResumeProgress?.(bytes, total);
-            },
-          });
         }
         await options.acquire(temporaryHandle, offset, async (completed) => {
           if (!Number.isSafeInteger(completed) || completed < offset || completed > record.bytes) throw new Error('Invalid OPFS download checkpoint.');
@@ -74,15 +66,13 @@ export class OpfsModelCacheBackend implements ModelCacheBlobBackend {
           offset = completed;
         });
       } else await writeOpfsStream(temporaryHandle, source);
-      // Hash the on-disk temp file incrementally before atomic promotion.
+      // Hash the on-disk temp file once before atomic promotion.
       await verifyBlobIntegrity(await temporaryHandle.getFile(), { bytes: record.bytes, sha256: record.sha256 },
         { onProgress: options.onVerifyProgress });
       options.assertCanCommit?.();
       await promoteOpfsFile(temporaryHandle, finalName);
       promoted = true;
-      const finalHandle = await directory.getFileHandle(finalName);
-      await verifyBlobIntegrity(await finalHandle.getFile(), { bytes: record.bytes, sha256: record.sha256 },
-        { onProgress: options.onCommitProgress });
+      await options.onCommitProgress?.(record.bytes, record.bytes);
       options.assertCanCommit?.();
       const complete: ModelCacheFileRecord = {
         ...record, backend: this.kind, locator: `${path}/${finalName}`, state: 'complete',

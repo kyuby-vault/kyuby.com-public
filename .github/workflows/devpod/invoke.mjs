@@ -4,7 +4,7 @@ import { resolve, join, relative, isAbsolute } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { resolvePagesEnvironment } from './host.mjs';
 
-export const readOnly = ['src', 'public', 'tests', 'integrations', 'docs', 'package.json', 'package-lock.json',
+export const readOnly = ['src', 'public', 'tests', 'integrations', 'docs', 'packages', 'package.json', 'package-lock.json',
   '.nvmrc', 'tsconfig.json', 'astro.config.mjs', 'playwright.config.ts', 'vitest.config.ts', 'wrangler.jsonc', 'scripts',
   '.github/workflows', 'Containerfile', '.dockerignore'];
 export const volumes = ['kyuby-node-modules', 'kyuby-astro-cache'];
@@ -45,7 +45,7 @@ export function containerArgs(root, target, env = process.env, { engine = env.CO
   const publicSnapshot = env.GITHUB_REPOSITORY === 'kyuby-vault/kyuby.com-public' && existsSync(join(root, 'PUBLIC-SNAPSHOT.json'));
   for (const path of readOnly) {
     if (!existsSync(join(root, path))) {
-      if (publicSnapshot && ['tests', 'docs', 'scripts', 'playwright.config.ts', 'vitest.config.ts'].includes(path)) continue;
+      if (publicSnapshot && ['tests', 'docs', 'scripts', 'playwright.config.ts', 'vitest.config.ts', 'packages'].includes(path)) continue;
       throw new Error(`Missing required DevPod input: ${path}`);
     }
     assertSafeInput(root, path);
