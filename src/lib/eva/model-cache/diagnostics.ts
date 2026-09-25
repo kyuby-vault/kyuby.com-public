@@ -112,7 +112,8 @@ export class AcquisitionDiagnostics {
 export function acquisitionDiagnosticError(error: unknown): string {
   const code = error && typeof error === 'object' && 'code' in error ? error.code : null;
   if (typeof code === 'string' && ['RPC_TIMEOUT', 'NOT_CONFIGURED', 'LEASE_REJECTED', 'CACHE_FAILED',
-    'HASH_MISMATCH', 'LENGTH_MISMATCH', 'VERIFY_TIMEOUT', 'REMOVE_FAILED'].includes(code)) return code;
+    'HASH_MISMATCH', 'LENGTH_MISMATCH', 'VERIFY_TIMEOUT', 'REMOVE_FAILED',
+    'NETWORK_STALLED', 'MODEL_SOURCE_UNAVAILABLE', 'RANGE_REVALIDATION_REQUIRED', 'MODEL_STREAM_REQUIRED'].includes(code)) return code;
   if (error instanceof Error && ['AbortError', 'QuotaExceededError', 'NetworkError', 'TypeError'].includes(error.name)) return error.name;
   return 'load-failed';
 }

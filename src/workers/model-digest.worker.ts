@@ -29,7 +29,7 @@ self.onmessage = async (event: MessageEvent<DigestWorkerRequest>) => {
   if (!buffer) return;
 
   const timer = setInterval(() => {
-    self.postMessage({ type: 'heartbeat', id, bytesProcessed: buffer.byteLength } satisfies DigestWorkerMessage);
+    self.postMessage({ type: 'heartbeat', id, bytesProcessed: 0 } satisfies DigestWorkerMessage);
   }, 250);
 
   try {

@@ -1,5 +1,7 @@
 import { ModelIntegrityError } from './integrity';
+import { WebGpuAdmissionError, WEBGPU_ADMISSION_COPY, type WebGpuAdmissionCode } from '../webgpu-admission';
 import type { ModelCacheStorageEstimate } from './types';
+import { ModelNetworkStallError } from './network-liveness';
 
 export const ACQUISITION_BACKOFF_MS = [2_000, 5_000, 15_000, 45_000] as const;
 export const ACQUISITION_MAX_ATTEMPTS = 4;
@@ -11,7 +13,8 @@ export const MINIMUM_STORAGE_HEADROOM = 256 * 1024 * 1024;
 export class AcquisitionNetworkError extends Error {}
 
 export function isAcquisitionNetworkError(error: unknown): boolean {
-  return !(error instanceof ModelIntegrityError) && error instanceof AcquisitionNetworkError;
+  return !(error instanceof ModelIntegrityError)
+    && (error instanceof AcquisitionNetworkError || error instanceof ModelNetworkStallError);
 }
 
 /** Only Fetch/stream-reader failures become retryable, never arbitrary storage TypeErrors. */
@@ -90,10 +93,11 @@ export function acquisitionCapacity(total: number, cached: number, estimate: Mod
 }
 
 export type AcquisitionNoticeCode = 'insufficient-storage' | 'cache-unavailable' | 'connection-lost'
-  | 'resuming' | 'verifying' | 'cache-service-restarted' | 'host-contract' | 'load-failed';
+  | 'resuming' | 'verifying' | 'cache-service-restarted' | 'host-contract' | 'load-failed' | WebGpuAdmissionCode;
 export const ACQUISITION_NOTICES: Record<AcquisitionNoticeCode, string> = {
+  ...WEBGPU_ADMISSION_COPY,
   'insufficient-storage': 'Not enough device storage. Free browser storage or remove an old cached model, then retry. Space for the model plus safety headroom is required.',
-  'cache-unavailable': 'Local cache unavailable. This browser blocked the local model cache. Eva can still load from the network, but will download again next time.',
+  'cache-unavailable': 'Local cache unavailable. A large model requires working browser storage. Your conversation is unchanged; enable site storage and retry.',
   'connection-lost': 'Download interrupted. The connection dropped. Completed download checkpoints are kept; resume continues where it stopped. They remain unverified until the full file passes SHA-256.',
   resuming: 'Resuming download. Continuing from the durable checkpoint on this device; the full file will be verified before use.',
   verifying: 'Verifying download. Checking the downloaded files before first use.',
@@ -104,6 +108,7 @@ export const ACQUISITION_NOTICES: Record<AcquisitionNoticeCode, string> = {
 
 /** The controller displays only this closed vocabulary; raw diagnostics are separate. */
 export function acquisitionFailureCode(error: unknown): AcquisitionNoticeCode {
+  if (error instanceof WebGpuAdmissionError) return error.code;
   if (error instanceof DOMException && error.name === 'QuotaExceededError') return 'insufficient-storage';
   return isAcquisitionNetworkError(error) ? 'connection-lost' : 'load-failed';
 }

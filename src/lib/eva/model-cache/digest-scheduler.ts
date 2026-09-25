@@ -1,12 +1,10 @@
-/**
- * src/lib/eva/model-cache/digest-scheduler.ts
- * Manages SHA-256 digest scheduling with heartbeat liveness.
- * Bounded by worker silence > 30s or worker death rather than an assumed MiB/s.
+/** Native SHA-256, one admitted input per realm, honest heartbeat semantics.
+ * A Service Worker cannot construct a Worker. Its native WebCrypto path remains
+ * explicit; no claim is made that its digest runs in our dedicated worker.
  */
-
 import type { DigestWorkerMessage, DigestWorkerRequest } from '../../../workers/model-digest.worker';
 
-export const MODEL_DIGEST_MODE = 'dedicated-worker-heartbeat' as const;
+export const MODEL_DIGEST_MODE = 'capability-selected-heartbeat' as const;
 export const MODEL_DIGEST_SILENCE_TIMEOUT_MS = 30_000;
 
 export class ModelDigestTimeoutError extends Error {
@@ -18,168 +16,129 @@ export class ModelDigestTimeoutError extends Error {
 }
 
 function bufferToHex(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  let hex = '';
-  for (let i = 0; i < bytes.length; i++) {
-    hex += bytes[i].toString(16).padStart(2, '0');
-  }
-  return hex;
+  return Array.from(new Uint8Array(buffer), byte => byte.toString(16).padStart(2, '0')).join('');
 }
 
-/**
- * One bounded hashing job per scope, independent of transfer concurrency.
- * Monitored by worker heartbeat liveness: fails only on silence > 30s or worker death.
- */
 export class ModelDigestScheduler {
+  lastMode: 'native-webcrypto-heartbeat' | 'dedicated-worker-heartbeat' | null = null;
   #tail: Promise<unknown> = Promise.resolve();
 
-  /**
-   * Run an arbitrary digest or verification operation with heartbeat liveness monitoring.
-   */
   run<T>(
     _bytes: number,
     operation: (signal: AbortSignal, touch: () => void) => Promise<T>,
     timeoutMs?: number,
   ): Promise<T> {
-    const result = this.#tail.then(async () => {
+    const previous = this.#tail;
+    let release!: () => void;
+    this.#tail = new Promise<void>(resolve => { release = resolve; });
+    return previous.then(async () => {
       const controller = new AbortController();
-      let lastLiveness = Date.now();
-      const touch = () => {
-        lastLiveness = Date.now();
-      };
-
-      let timer: ReturnType<typeof setInterval> | undefined;
+      let lastLiveness = performance.now();
+      const touch = () => { lastLiveness = performance.now(); };
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let watchdog: ReturnType<typeof setInterval> | undefined;
+      const work = Promise.resolve().then(() => operation(controller.signal, touch));
+      // WebCrypto and Blob.arrayBuffer() are not abortable. Do not admit another
+      // input merely because the caller's watchdog returned first.
+      void work.then(release, release);
       try {
-        return await Promise.race([
-          operation(controller.signal, touch),
-          new Promise<never>((_resolve, reject) => {
-            if (timeoutMs !== undefined) {
-              const directTimer = setTimeout(() => {
-                const error = new ModelDigestTimeoutError();
-                controller.abort(error);
-                reject(error);
-              }, timeoutMs);
-              controller.signal.addEventListener('abort', () => clearTimeout(directTimer), { once: true });
-            } else {
-              timer = setInterval(() => {
-                if (Date.now() - lastLiveness > MODEL_DIGEST_SILENCE_TIMEOUT_MS) {
-                  clearInterval(timer);
-                  const error = new ModelDigestTimeoutError();
-                  controller.abort(error);
-                  reject(error);
-                }
-              }, 500);
-            }
-          }),
-        ]);
+        return await Promise.race([work, new Promise<never>((_, reject) => {
+          const fail = () => {
+            const error = new ModelDigestTimeoutError();
+            controller.abort(error);
+            reject(error);
+          };
+          if (timeoutMs !== undefined) timer = setTimeout(fail, timeoutMs);
+          else watchdog = setInterval(() => {
+            if (performance.now() - lastLiveness > MODEL_DIGEST_SILENCE_TIMEOUT_MS) fail();
+          }, 500);
+        })]);
       } finally {
-        if (timer !== undefined) clearInterval(timer);
+        if (timer !== undefined) clearTimeout(timer);
+        if (watchdog !== undefined) clearInterval(watchdog);
       }
     });
-
-    this.#tail = result.then(() => undefined, () => undefined);
-    return result;
   }
 
-  /**
-   * Digest a whole ArrayBuffer using the dedicated digest worker when available,
-   * falling back to crypto.subtle in ServiceWorkerGlobalScope where Worker is unavailable.
+  /** Blob input is lazy: allocation occurs only AFTER queue admission.
+   * Legacy callers may still provide a preallocated ArrayBuffer.
    */
   async digestBuffer(
-    buffer: ArrayBuffer,
+    input: ArrayBuffer | Blob,
     signal?: AbortSignal,
     onProgress?: (hashedBytes: number, totalBytes: number) => void | Promise<void>,
   ): Promise<{ bytes: number; sha256: string }> {
-    return this.run(buffer.byteLength, async (internalSignal, touch) => {
-      if (signal?.aborted) throw signal.reason;
-
-      const combinedAbort = () => {
-        if (signal?.aborted) throw signal.reason;
-        internalSignal.throwIfAborted();
+    const size = input instanceof Blob ? input.size : input.byteLength;
+    return this.run(size, async (internalSignal, touch) => {
+      const check = () => { signal?.throwIfAborted(); internalSignal.throwIfAborted(); };
+      check();
+      // This indicates a live host event loop, NOT hashing progress. Native
+      // async work has no per-byte progress API. A stuck promise remains a
+      // cancellation/owner-restart problem, not a guessed MiB/s failure.
+      let nativeHeartbeat: ReturnType<typeof setInterval> | undefined = setInterval(touch, 250);
+      const stopNativeHeartbeat = () => {
+        if (nativeHeartbeat !== undefined) clearInterval(nativeHeartbeat);
+        nativeHeartbeat = undefined;
       };
-
-      const byteLength = buffer.byteLength;
-      const id = `digest-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-
-      // Dedicated Worker path (when Worker constructor is exposed, e.g. Window or DedicatedWorker)
-      if (typeof Worker !== 'undefined') {
-        return new Promise<{ bytes: number; sha256: string }>((resolve, reject) => {
-          let worker: Worker | null = null;
-          try {
-            worker = new Worker(
-              new URL('../../../workers/model-digest.worker.ts', import.meta.url),
-              { type: 'module' },
-            );
-          } catch {
-            // If worker instantiation fails (e.g. strict CSP or environment limitation), fall through to crypto.subtle
-            worker = null;
-          }
-
-          if (!worker) {
-            combinedAbort();
-            touch();
-            crypto.subtle.digest('SHA-256', buffer).then(
-              digest => {
-                touch();
-                void onProgress?.(byteLength, byteLength);
-                resolve({ bytes: byteLength, sha256: bufferToHex(digest) });
-              },
-              reject,
-            );
-            return;
-          }
-
+      try {
+        const buffer = input instanceof Blob ? await input.arrayBuffer() : input;
+        check();
+        const byteLength = buffer.byteLength;
+        let worker: Worker | null = null;
+        if (typeof Worker !== 'undefined') {
+          try { worker = new Worker(new URL('../../../workers/model-digest.worker.ts', import.meta.url), { type: 'module' }); }
+          catch { /* CSP or worker support failure: keep the explicit native path. */ }
+        }
+        this.lastMode = worker ? 'dedicated-worker-heartbeat' : 'native-webcrypto-heartbeat';
+        if (!worker) {
+          const digest = await crypto.subtle.digest('SHA-256', buffer);
+          check();
+          await onProgress?.(byteLength, byteLength);
+          check();
+          return { bytes: byteLength, sha256: bufferToHex(digest) };
+        }
+        stopNativeHeartbeat();
+        const activeWorker = worker;
+        const id = crypto.randomUUID();
+        const result = await new Promise<{ bytes: number; sha256: string }>((resolve, reject) => {
+          let settled = false;
           const cleanup = () => {
-            if (worker) {
-              worker.onmessage = null;
-              worker.onerror = null;
-              worker.terminate();
-              worker = null;
-            }
+            signal?.removeEventListener('abort', abort);
+            internalSignal.removeEventListener('abort', abort);
+            activeWorker.onmessage = null;
+            activeWorker.onerror = null;
+            activeWorker.onmessageerror = null;
+            activeWorker.terminate();
           };
-
-          const onAbort = () => {
-            cleanup();
-            reject(signal?.reason || internalSignal.reason);
-          };
-
-          signal?.addEventListener('abort', onAbort, { once: true });
-          internalSignal.addEventListener('abort', onAbort, { once: true });
-
-          worker.onmessage = (event: MessageEvent<DigestWorkerMessage>) => {
+          const fail = (reason: unknown) => { if (!settled) { settled = true; cleanup(); reject(reason); } };
+          const abort = () => fail(signal?.reason ?? internalSignal.reason ?? new DOMException('Cancelled.', 'AbortError'));
+          activeWorker.onmessage = (event: MessageEvent<DigestWorkerMessage>) => {
             const msg = event.data;
-            if (msg.id !== id) return;
-
-            touch();
-            if (msg.type === 'heartbeat') {
-              void onProgress?.(msg.bytesProcessed, byteLength);
-            } else if (msg.type === 'result') {
-              cleanup();
-              void onProgress?.(msg.bytes, byteLength);
-              resolve({ bytes: msg.bytes, sha256: msg.sha256 });
-            } else if (msg.type === 'error') {
-              cleanup();
-              reject(new Error(msg.error));
+            if (!msg || msg.id !== id) return;
+            if (msg.type === 'heartbeat') { touch(); return; } // Never report unverified bytes.
+            if (msg.type === 'error') { fail(new Error('The digest worker failed.')); return; }
+            if (msg.type !== 'result' || msg.bytes !== byteLength || !/^[a-f0-9]{64}$/.test(msg.sha256)) {
+              fail(new Error('Invalid digest worker response.')); return;
             }
+            if (settled) return;
+            settled = true;
+            touch(); cleanup();
+            resolve({ bytes: msg.bytes, sha256: msg.sha256 });
           };
-
-          worker.onerror = (err) => {
-            cleanup();
-            reject(new Error(`Digest worker error: ${err.message || 'Worker terminated unexpectedly'}`));
-          };
-
-          const request: DigestWorkerRequest = { id, buffer };
-          worker.postMessage(request, [buffer]);
+          activeWorker.onerror = () => fail(new Error('The digest worker failed.'));
+          activeWorker.onmessageerror = () => fail(new Error('The digest worker response could not be decoded.'));
+          signal?.addEventListener('abort', abort, { once: true });
+          internalSignal.addEventListener('abort', abort, { once: true });
+          try {
+            check();
+            activeWorker.postMessage({ id, buffer } satisfies DigestWorkerRequest, [buffer]);
+          } catch (error) { fail(error); }
         });
-      }
-
-      // Fallback for ServiceWorkerGlobalScope where typeof Worker === 'undefined'
-      combinedAbort();
-      touch();
-      const digest = await crypto.subtle.digest('SHA-256', buffer);
-      touch();
-      void onProgress?.(byteLength, byteLength);
-      return { bytes: byteLength, sha256: bufferToHex(digest) };
+        check();
+        await onProgress?.(result.bytes, result.bytes);
+        check();
+        return result;
+      } finally { stopNativeHeartbeat(); }
     });
   }
 }

@@ -52,6 +52,7 @@ export class EvaWorkerClient extends EventTarget {
     });
     this.#worker.addEventListener('message', this.#handleMessage);
     this.#worker.addEventListener('error', this.#handleWorkerError);
+    this.#worker.addEventListener('messageerror', this.#handleMessageError);
   }
 
   get state(): EvaWorkerState {
@@ -132,6 +133,7 @@ export class EvaWorkerClient extends EventTarget {
   terminate(): void {
     this.#worker.removeEventListener('message', this.#handleMessage);
     this.#worker.removeEventListener('error', this.#handleWorkerError);
+    this.#worker.removeEventListener('messageerror', this.#handleMessageError);
     this.#worker.terminate();
     for (const pending of this.#pending.values()) {
       pending.reject(new Error('Eva worker was terminated.'));
@@ -140,7 +142,14 @@ export class EvaWorkerClient extends EventTarget {
   }
 
   #post(request: EvaWorkerRequest): void {
-    this.#worker.postMessage(request);
+    try { this.#worker.postMessage(request); }
+    catch {
+      const pending = this.#pending.get(request.requestId);
+      this.#pending.delete(request.requestId);
+      const error = new Error('Eva could not send a runtime command.');
+      pending?.reject(error);
+      this.dispatchEvent(new CustomEvent<Error>('evaerror', { detail: error }));
+    }
   }
 
   #waitFor<T>(
@@ -206,6 +215,15 @@ export class EvaWorkerClient extends EventTarget {
         detail: response,
       }));
     }
+  };
+
+  #handleMessageError = (): void => {
+    // An undecodable response must not leave requests pending forever.
+    const error = new Error('Eva could not decode a runtime response.');
+    for (const pending of this.#pending.values()) pending.reject(error);
+    this.#pending.clear();
+    this.terminate();
+    this.dispatchEvent(new CustomEvent<Error>('evaerror', { detail: error }));
   };
 
   #handleWorkerError = (event: ErrorEvent): void => {

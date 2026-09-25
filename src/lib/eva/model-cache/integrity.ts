@@ -5,8 +5,8 @@ import { ModelDigestScheduler } from './digest-scheduler';
 
 const digestScheduler = new ModelDigestScheduler();
 
-// Worker is not exposed in ServiceWorkerGlobalScope. Use the scheduling TDD's
-// in-thread fallback, with the owner's 4 MiB budget and an explicit task yield.
+// Legacy streaming helper budgets. hashBlob uses bounded-per-file native
+// WebCrypto after queue admission; these are NOT its peak memory bound.
 export const MODEL_CACHE_HASH_CHUNK_BYTES = 4 * 1024 * 1024;
 export const MODEL_CACHE_MAX_HASH_CHUNK_BYTES = 8 * 1024 * 1024;
 
@@ -169,8 +169,8 @@ export async function hashBlob(
     );
   }
 
-  const buffer = await blob.arrayBuffer();
-  return digestScheduler.digestBuffer(buffer, undefined, options.onProgress);
+  // Queue the Blob reference, not a preallocated shard-sized ArrayBuffer.
+  return digestScheduler.digestBuffer(blob, undefined, options.onProgress);
 }
 
 export function assertModelIntegrity(

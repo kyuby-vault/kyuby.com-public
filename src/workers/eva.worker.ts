@@ -1,6 +1,7 @@
 /// <reference lib="webworker" />
 
 import * as transformers from '@huggingface/transformers';
+import { requireWebGpu } from '../lib/eva/webgpu-admission';
 import { deriveEvaBudgets, generationFinishReason, generationTokenBudget, isEvaKvAllowance, probeEvaDevice } from '../lib/eva/generation-budget';
 import { tokenTail } from '../lib/eva/continuation';
 import { estimateContextTokens } from '../lib/eva/context-manager';
@@ -27,7 +28,7 @@ const {
 const workerScope = self as DedicatedWorkerGlobalScope;
 const stoppingCriteria = new InterruptableStoppingCriteria();
 const CACHE_MESSAGE_TIMEOUT_MS = 5_000;
-const PINNED_ORT_WASM_BASE = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.26.0-dev.20260416-b7804b056c/dist/';
+const PINNED_ORT_WASM_BASE = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.0-dev.20260914-8d85527a0/dist/';
 
 type LoadedTokenizer = Awaited<ReturnType<typeof AutoTokenizer.from_pretrained>>;
 type LoadedModel = Awaited<ReturnType<typeof AutoModelForCausalLM.from_pretrained>>;
@@ -49,10 +50,8 @@ env.useBrowserCache = false;
 if (env.backends?.onnx?.wasm) {
   env.backends.onnx.wasm.proxy = false;
   env.backends.onnx.wasm.numThreads = 1;
-  env.backends.onnx.wasm.wasmPaths = {
-    mjs: `${PINNED_ORT_WASM_BASE}ort-wasm-simd-threaded.asyncify.mjs`,
-    wasm: `${PINNED_ORT_WASM_BASE}ort-wasm-simd-threaded.asyncify.wasm`,
-  };
+  // Let this exact runtime build select its matching WASM/glue flavor.
+  env.backends.onnx.wasm.wasmPaths = PINNED_ORT_WASM_BASE;
 }
 
 function post(response: EvaWorkerResponse): void {
@@ -220,9 +219,7 @@ async function disposeModel(): Promise<void> {
 }
 
 async function loadModel(request: Extract<EvaWorkerRequest, { type: 'load' }>): Promise<void> {
-  if (request.config.testFixture !== 'model-cache' && !('gpu' in navigator)) {
-    throw new Error('WebGPU is required. Open Eva in a current Chrome or Edge browser with WebGPU enabled.');
-  }
+  if (request.config.testFixture !== 'model-cache') await requireWebGpu();
 
   await disposeModel();
   setState(request.requestId, 'loading');

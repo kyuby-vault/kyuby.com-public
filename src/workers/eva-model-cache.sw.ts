@@ -1,9 +1,11 @@
 /// <reference lib="webworker" />
 
 import { ModelIntegrityError, verifyBlobIntegrity } from '../lib/eva/model-cache/integrity';
+import { assertModelMemoryFallback } from '../lib/eva/model-cache/memory-fallback-policy';
 import { ModelDigestTimeoutError } from '../lib/eva/model-cache/digest-scheduler';
 import { AcquisitionDiagnostics, acquisitionDiagnosticError } from '../lib/eva/model-cache/diagnostics';
 import { acquireModelChunks, RangeUnavailableError } from '../lib/eva/model-cache/acquisition';
+import { fetchModelResponse } from '../lib/eva/model-cache/network-liveness';
 import { acquireWithRetry, acquisitionNetworkOperation, isAcquisitionNetworkError, AcquisitionNetworkError, DESKTOP_CHUNK_BYTES } from '../lib/eva/model-cache/resilience';
 import { writeOpfsStream } from '../lib/eva/model-cache/opfs-files';
 import { arbitrateModelLeases, sameLeasePackage } from '../lib/eva/model-cache/arbitration';
@@ -1237,23 +1239,25 @@ async function fetchFullArtifact(
   acquisition: ArtifactAcquisitionContext,
 ): Promise<Response> {
   diagnostics.record({ kind: 'full-fetch', file: file.path, total: file.bytes });
-  const response = await acquisitionNetworkOperation(() => fetch(url, {
+  const response = await acquisitionNetworkOperation(() => fetchModelResponse(requestSignal => fetch(url, {
     method: 'GET',
     mode: 'cors',
     credentials: 'omit',
     redirect: 'error',
     cache: 'no-store',
-    signal: acquisition.controller.signal,
+    signal: requestSignal,
     headers: { Accept: file.contentType },
+  }), acquisition.controller.signal, raw => {
+    // Validate the original URL/response type before wrapping the body.
+    const check = checkModelCacheNetworkResponse(raw, url);
+    if (raw.status >= 500 && raw.status <= 599) {
+      throw new AcquisitionNetworkError('Model download service temporarily unavailable.');
+    }
+    if (!check.ok || raw.status !== 200 || !raw.body) {
+      throw new Error('The model source returned an unusable response.');
+    }
   }));
-  const check = checkModelCacheNetworkResponse(response, url);
-  if (response.status >= 500 && response.status <= 599) {
-    await response.body?.cancel();
-    throw new AcquisitionNetworkError('Model download service temporarily unavailable.');
-  }
-  if (!check.ok || response.status !== 200 || !response.body) {
-    throw new Error(`Eva model file ${file.path} returned an unusable response.`);
-  }
+  if (!response.body) throw new Error('The model response has no stream.');
   return new Response(withDownloadProgress(response.body, file, acquisition), {
     status: response.status,
     statusText: response.statusText,
@@ -1289,6 +1293,7 @@ async function verifiedNetworkBlob(
   file: ModelCachePresentManifestFile,
   acquisition: ArtifactAcquisitionContext,
 ): Promise<Blob> {
+  assertModelMemoryFallback(file.bytes); // Refuse before a second large network transfer starts.
   const response = await fetchFullArtifact(url, file, acquisition);
   const blob = await response.blob();
   await verifyBlobIntegrity(blob, file, {
@@ -1396,9 +1401,10 @@ async function acquireArtifact(
         } : undefined,
       });
     } catch (error) {
-      if (error instanceof ModelDigestTimeoutError || error instanceof DOMException && error.name === 'AbortError') throw error;
-      await store.invalidateFile(descriptor, file.path).catch(() => undefined);
-      packageWasComplete = true;
+      // readFile already drops proven missing/corrupt content. Allocation,
+      // OPFS, metadata I/O and verification-worker failures are not evidence
+      // that the shared model is corrupt. Preserve it and fail this load.
+      throw error;
     }
     if (cached) {
       if (matched.lease) {
@@ -1539,11 +1545,11 @@ async function acquireArtifact(
                 await checkpoint(completed); durableOffset = completed;
                 await acquisitionActivity(acquisitionContext);
               },
-              fetch: async (start, end) => {
+              fetch: async (start, end, requestSignal) => {
                 requireLiveAcquisitionLease(acquisitionContext);
                 diagnostics.record({ kind: 'range', file: file.path, start, end, total: file.bytes });
                 const result = await fetch(matched.route.url, { mode: 'cors', credentials: 'omit', redirect: 'error', cache: 'no-store',
-                  signal: acquisitionContext.controller.signal, headers: { Accept: file.contentType, Range: `bytes=${start}-${end}` } });
+                  signal: requestSignal, headers: { Accept: file.contentType, Range: `bytes=${start}-${end}` } });
                 diagnostics.record({ kind: 'range-response', file: file.path, start, end, status: result.status });
                 if (result.type === 'opaque' || (result.url && result.url !== matched.route.url)) {
                   await result.body?.cancel();

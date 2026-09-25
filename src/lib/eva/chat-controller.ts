@@ -1,4 +1,5 @@
 import evaSystemPrompt from '../../agents/eva.md?raw';
+import { requireWebGpu, WebGpuAdmissionError } from './webgpu-admission';
 import {
   createElement as createLucideElement,
   createIcons,
@@ -107,7 +108,6 @@ import {
 import {
   fetchEvaModelConfig,
   getEvaRuntimeSettings,
-  hasWebGpu,
   normalizeEvaRuntimeSettings,
 } from './runtime';
 import {
@@ -1410,13 +1410,18 @@ export async function mountEvaChat(): Promise<void> {
       dispatchUi({ type: 'PREFLIGHT_FAILED', error: 'The model endpoint is unavailable.' });
       return;
     }
-    if (!fixtureMode && !hasWebGpu()) {
-      runtimeProvider.textContent = 'Unavailable';
-      modelLabel.textContent = 'WebGPU is not available';
-      runtimeNoticeText.textContent = 'WebGPU is required. Open Eva in a current Chrome or Edge browser with WebGPU enabled.';
-      dispatchUi({ type: 'RESIDENCY_CHANGED', residency: 'network-only' });
-      dispatchUi({ type: 'PREFLIGHT_FAILED', error: 'WebGPU is unavailable.' });
-      return;
+    if (!fixtureMode) {
+      try { await requireWebGpu(); }
+      catch (error) {
+        const message = error instanceof WebGpuAdmissionError ? error.message : 'The GPU check failed. Retry without downloading the model.';
+        runtimeProvider.textContent = 'Unavailable';
+        modelLabel.textContent = 'WebGPU is not ready';
+        runtimeNoticeText.textContent = message;
+        retryRuntimeButton.hidden = false;
+        // A GPU failure says nothing about OPFS residency.
+        dispatchUi({ type: 'PREFLIGHT_FAILED', error: message });
+        return;
+      }
     }
 
     try {
@@ -1604,6 +1609,7 @@ export async function mountEvaChat(): Promise<void> {
     dispatchUi({ type: 'LOAD_STARTED', source: initialSource });
 
     try {
+      if (!fixtureMode) await requireWebGpu(); // Revalidate immediately before acquiring a lease.
       if ((!fixtureMode || fixtureMode === 'model-cache') && 'serviceWorker' in navigator && !cacheClient.availability.available) {
         acquisitionFailure = 'cache-unavailable';
         throw new Error('The cache service has not attached. Retry instead of starting an uncached download.');

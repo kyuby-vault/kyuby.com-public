@@ -513,7 +513,8 @@ export class ModelCacheStore {
         } catch (error) {
           // Cancellation/timeout is not evidence of corrupt bytes. Never delete
           // a healthy shared file because its requesting page closed mid-hash.
-          if (!(error instanceof ModelIntegrityError)) throw error;
+          if (!(error instanceof ModelIntegrityError)
+            || !['HASH_MISMATCH', 'LENGTH_MISMATCH'].includes(error.code)) throw error;
           await this.#dropFile(record);
           return null;
         }
