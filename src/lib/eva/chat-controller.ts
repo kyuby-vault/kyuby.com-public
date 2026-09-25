@@ -1693,6 +1693,7 @@ export async function mountEvaChat(): Promise<void> {
       }
       renderBudgets();
       loadProgress.hidden = true;
+      acquisitionWakeLock.stop();
       dispatchUi({ type: 'LOAD_READY' });
       runtimeNoticeText.textContent = readyNotice(uiState.warning);
       if (!diskOnly) input.focus();

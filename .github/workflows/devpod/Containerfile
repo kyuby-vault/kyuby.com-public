@@ -1,6 +1,6 @@
 # Node 26.x: Cloudflare Pages build compatibility without freezing patch updates.
 # Each rebuilt image is validated by the smoke checks and full DevPod gates.
-FROM docker.io/library/node:26-bookworm-slim
+FROM docker.io/library/node:26-bookworm-slim@sha256:0a992e1420e2d70611578f1844a6f10a9d11fe6bb535aabf72efe3007f13d79b
 LABEL com.kyuby.devpod="true"
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
     WRANGLER_SEND_METRICS=false ASTRO_TELEMETRY_DISABLED=1 \
@@ -15,6 +15,7 @@ COPY package.json package-lock.json .nvmrc ./
 # No blanket postinstall execution: esbuild/workerd/sharp platform binaries arrive
 # as locked optional packages; onnxruntime-node is not used by browser inference.
 # Playwright's browser/system install is the sole explicit installer below.
+RUN npm install -g npm@12.1.0
 RUN npm ci --ignore-scripts \
     && npx --no-install playwright install --with-deps chromium \
     && sha256sum package-lock.json | cut -d ' ' -f1 > /opt/kyuby-lock-sha \

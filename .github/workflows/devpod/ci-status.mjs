@@ -63,7 +63,7 @@ export function createCiMonitor({ env = process.env, invoke = gh, now = Date.now
       && !['success', 'skipped'].includes(job.conclusion)).map(job => job.name);
     return names.length ? names.join(', ') : 'none reported';
   }
-  async function green(repo, sha, { allowSkippedPreview = false, waitForCreation = false } = {}) {
+  async function green(repo, sha, { allowSkippedPreview = false, waitForCreation = true } = {}) {
     repository = repo; current = undefined;
     if (![PRIVATE, PUBLIC].includes(repo) || !/^[a-f0-9]{40}$/.test(sha)) fail('Expected an approved repository and full immutable SHA');
     const start = now(); const budget = waitBudget();
@@ -135,7 +135,7 @@ export function createCiMonitor({ env = process.env, invoke = gh, now = Date.now
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   try {
     const monitor = createCiMonitor();
-    if (process.argv[2] === 'private') await monitor.green(PRIVATE, process.argv[3], { allowSkippedPreview: true });
+    if (process.argv[2] === 'private') await monitor.green(PRIVATE, process.argv[3], { allowSkippedPreview: true, waitForCreation: true });
     else if (process.argv[2] === 'preview') await monitor.preview(process.argv[3]);
     else throw new Error('Use private <sha> or preview <sha>.');
   } catch (error) { console.error(error.message); process.exitCode = 1; }
