@@ -92,12 +92,13 @@ export function acquisitionCapacity(total: number, cached: number, estimate: Mod
   return available < remaining + headroom * 2 ? 'tight' : 'ok';
 }
 
-export type AcquisitionNoticeCode = 'insufficient-storage' | 'cache-unavailable' | 'connection-lost'
+export type AcquisitionNoticeCode = 'insufficient-storage' | 'cache-unavailable' | 'storage-best-effort' | 'connection-lost'
   | 'resuming' | 'verifying' | 'cache-service-restarted' | 'host-contract' | 'load-failed' | WebGpuAdmissionCode;
 export const ACQUISITION_NOTICES: Record<AcquisitionNoticeCode, string> = {
   ...WEBGPU_ADMISSION_COPY,
   'insufficient-storage': 'Not enough device storage. Free browser storage or remove an old cached model, then retry. Space for the model plus safety headroom is required.',
   'cache-unavailable': 'Local cache unavailable. A large model requires working browser storage. Your conversation is unchanged; enable site storage and retry.',
+  'storage-best-effort': 'Storage is best-effort. The browser or operating system may clear cached files under storage pressure.',
   'connection-lost': 'Download interrupted. The connection dropped. Completed download checkpoints are kept; resume continues where it stopped. They remain unverified until the full file passes SHA-256.',
   resuming: 'Resuming download. Continuing from the durable checkpoint on this device; the full file will be verified before use.',
   verifying: 'Verifying download. Checking the downloaded files before first use.',

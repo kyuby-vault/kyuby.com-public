@@ -98,6 +98,7 @@ import { acquisitionDiagnosticError, acquisitionDiagnosticsJson, copyAcquisition
 import { AcquisitionWakeLock } from './model-cache/wake-lock';
 import { ACQUISITION_NOTICES, acquisitionCapacity, acquisitionDevicePolicy, acquisitionFailureCode, terminateFailedLoad,
   type AcquisitionCapacity, type AcquisitionNoticeCode } from './model-cache/resilience';
+import { probeStorageAdmission } from './model-cache/storage-admission';
 import {
   INITIAL_MODEL_CACHE_UI_STATE,
   MODEL_CACHE_CORRUPTION_WARNING,
@@ -538,6 +539,15 @@ export async function mountEvaChat(): Promise<void> {
   const clearDataButton = requiredElement<HTMLButtonElement>('clear-local-data');
   const clearDialog = requiredElement<HTMLDialogElement>('clear-dialog');
   const confirmClearButton = requiredElement<HTMLButtonElement>('confirm-clear');
+  const mobileMemoryDialog = requiredElement<HTMLDialogElement>('mobile-memory-dialog');
+  const confirmMobileMemoryButton = requiredElement<HTMLButtonElement>('confirm-mobile-memory');
+  let mobileMemoryWarningAccepted = false;
+
+  function hasLimitedMemory(): boolean {
+    const nav = navigator as Navigator & { deviceMemory?: number };
+    if (typeof nav.deviceMemory === 'number' && nav.deviceMemory > 0 && nav.deviceMemory < 6) return true;
+    return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || '');
+  }
   const sessionsPanel = requiredElement<HTMLElement>('sessions-panel');
   const inspector = requiredElement<HTMLElement>('inspector');
   const drawerScrim = requiredElement<HTMLElement>('drawer-scrim');
@@ -604,9 +614,9 @@ export async function mountEvaChat(): Promise<void> {
     }
   }, navigator, document, code => cacheClient.diagnostics.record({ kind: 'wake-lock', code }));
 
-  function acquisitionNotice(code: AcquisitionNoticeCode): void {
+  function acquisitionNotice(code: AcquisitionNoticeCode, customMessage?: string): void {
     runtimeNotice.dataset.acquisition = code;
-    runtimeNoticeText.textContent = ACQUISITION_NOTICES[code];
+    runtimeNoticeText.textContent = customMessage ?? ACQUISITION_NOTICES[code];
   }
 
   function acquisitionDiagnostic(error: unknown): void {
@@ -1122,18 +1132,27 @@ export async function mountEvaChat(): Promise<void> {
   }
 
   async function refreshStorageStatus(): Promise<void> {
-    browserStorage = await inspectBrowserStorage();
-    capacity = acquisitionCapacity(cacheStatus?.totalBytes ?? modelConfig?.manifest.cacheInventory?.totalBytes ?? 0,
-      cacheStatus?.cachedBytes ?? 0, browserStorage.estimate);
-    cacheClient.diagnostics.record({ kind: 'preflight', code: capacity,
-      total: cacheStatus?.totalBytes ?? modelConfig?.manifest.cacheInventory?.totalBytes ?? 0,
+    const total = cacheStatus?.totalBytes ?? modelConfig?.manifest.cacheInventory?.totalBytes ?? 0;
+    const cached = cacheStatus?.cachedBytes ?? 0;
+    const admission = await probeStorageAdmission(total, cached);
+    browserStorage = {
+      persistence: admission.persisted ? 'persistent' : 'best-effort',
+      estimate: { usage: admission.usage, quota: admission.quota },
+    };
+    capacity = admission.state === 'insufficient-storage' ? 'insufficient' : acquisitionCapacity(total, cached, browserStorage.estimate);
+    cacheClient.diagnostics.record({ kind: 'preflight', code: admission.state,
+      total,
       ...(browserStorage.estimate.usage === null ? {} : { usage: browserStorage.estimate.usage }),
       ...(browserStorage.estimate.quota === null ? {} : { quota: browserStorage.estimate.quota }) });
     capacityLabel.dataset.state = capacity;
     capacityLabel.textContent = capacity === 'ok' ? 'OK · space available'
       : capacity === 'tight' ? 'Tight · may need cleanup; the browser estimate is limited'
         : 'Insufficient · free browser storage or remove an old cached model, then Retry';
-    if (capacity === 'insufficient' && uiState.session === 'unloaded') acquisitionNotice('insufficient-storage');
+    if (admission.state === 'insufficient-storage' && uiState.session === 'unloaded') {
+      acquisitionNotice('insufficient-storage', admission.message);
+    } else if (admission.state === 'cache-unavailable' && uiState.session === 'unloaded') {
+      acquisitionNotice('cache-unavailable', admission.message);
+    }
     renderUi();
   }
 
@@ -1621,7 +1640,20 @@ export async function mountEvaChat(): Promise<void> {
         cacheConfigured = true;
       }
       await refreshStorageStatus();
-      if (!diskOnly && capacity === 'insufficient') throw new DOMException('Insufficient acquisition storage.', 'QuotaExceededError');
+      const admission = await probeStorageAdmission(
+        cacheStatus?.totalBytes ?? modelConfig?.manifest.cacheInventory?.totalBytes ?? 0,
+        cacheStatus?.cachedBytes ?? 0,
+      );
+      if (admission.state === 'cache-unavailable') {
+        acquisitionFailure = 'cache-unavailable';
+        acquisitionNotice('cache-unavailable', admission.message);
+        throw new Error(admission.message);
+      }
+      if (!diskOnly && (capacity === 'insufficient' || admission.state === 'insufficient-storage')) {
+        acquisitionFailure = 'insufficient-storage';
+        acquisitionNotice('insufficient-storage', admission.message);
+        throw new DOMException(admission.message, 'QuotaExceededError');
+      }
       if (diskOnly && !cacheConfigured) throw new Error('Disk-only loading requires the verified local cache.');
       if (cacheConfigured) {
         try {
@@ -1755,13 +1787,18 @@ export async function mountEvaChat(): Promise<void> {
         return;
       }
       acquisitionDiagnostic(error);
-      acquisitionNotice(acquisitionFailure ?? acquisitionFailureCode(error));
-      if (devicePolicy().mobile && acquisitionFailure === 'cache-unavailable') {
+      const failureCode = acquisitionFailure ?? acquisitionFailureCode(error);
+      const isCustomError = error instanceof Error && error.message && (
+        error.message.includes('Safari storage limit reached') || error.message.includes('Private Browsing')
+      );
+      const noticeMessage = isCustomError ? error.message : ACQUISITION_NOTICES[failureCode];
+      acquisitionNotice(failureCode, noticeMessage);
+      if (!isCustomError && devicePolicy().mobile && acquisitionFailure === 'cache-unavailable') {
         runtimeNoticeText.textContent = 'Local cache unavailable. This download is paused; no uncached model download was started. Enable site storage or try another browser, then Retry.';
       }
       dispatchUi({
         type: 'LOAD_FAILED',
-        error: ACQUISITION_NOTICES[acquisitionFailure ?? acquisitionFailureCode(error)],
+        error: noticeMessage,
       });
       patchUiState({
         residency: cacheStatus?.residency ?? uiState.residency,
@@ -2216,7 +2253,20 @@ export async function mountEvaChat(): Promise<void> {
       updateControls();
     }
   });
-  loadButton.addEventListener('click', () => void loadModel());
+  function triggerLoadWithMemoryCheck(): void {
+    if (!mobileMemoryWarningAccepted && hasLimitedMemory()) {
+      mobileMemoryDialog.showModal();
+      return;
+    }
+    void loadModel();
+  }
+
+  loadButton.addEventListener('click', triggerLoadWithMemoryCheck);
+  confirmMobileMemoryButton.addEventListener('click', () => {
+    mobileMemoryWarningAccepted = true;
+    mobileMemoryDialog.close('confirm');
+    void loadModel();
+  });
   downloadConcurrency.addEventListener('change', () => {
     localStorage.setItem('kyuby-eva-download-concurrency', downloadConcurrency.value === '4' ? '4' : '2');
   });
@@ -2233,7 +2283,7 @@ export async function mountEvaChat(): Promise<void> {
       if (runtime === pausedRuntime) runtime = null;
     });
   });
-  resumeDownload.addEventListener('click', () => { void loadModel(); });
+  resumeDownload.addEventListener('click', triggerLoadWithMemoryCheck);
   requestPersistenceButton.addEventListener('click', () => void requestPersistence());
   experimentalUiToggle.addEventListener('change', () => {
     experimentalUi = experimentalUiToggle.checked;

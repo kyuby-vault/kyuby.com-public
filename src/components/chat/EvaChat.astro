@@ -305,6 +305,17 @@
       </div>
     </form>
   </dialog>
+
+  <dialog class="confirm-dialog" id="mobile-memory-dialog">
+    <form method="dialog">
+      <h2>Limited memory warning</h2>
+      <p id="mobile-memory-copy">This device has limited memory. Loading this 3GB model may cause the browser tab to crash. Continue anyway?</p>
+      <div class="dialog-actions">
+        <button class="command-button" value="cancel">Cancel</button>
+        <button class="command-button command-button--primary" id="confirm-mobile-memory" value="confirm">Continue</button>
+      </div>
+    </form>
+  </dialog>
 </section>
 
 <script>

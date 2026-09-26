@@ -128,12 +128,10 @@ export class OpfsModelCacheBackend implements ModelCacheBlobBackend {
     await writeOpfsStream(await directory.getFileHandle(parts[1]), new Blob([new ArrayBuffer(record.bytes)]));
   }
 
-  async reconcile(validFiles: ModelCacheFileRecord[], _now: number): Promise<Set<string>> {
+  async reconcile(validFiles: ModelCacheFileRecord[], _now: number): Promise<{ missing: Set<string>; bytesReclaimed: number }> {
+    let bytesReclaimed = 0;
     const missing = new Set<string>();
     const validByLocator = new Map(validFiles.map((file) => [file.locator, file]));
-    const resumable = new Set((await this.repository.listTemporary()).filter((entry) => entry.resume
-      && Number.isSafeInteger(entry.resume.offset) && entry.resume.offset > 0 && entry.resume.offset <= entry.resume.bytes
-      && /^[a-f0-9]{64}$/.test(entry.resume.sha256) && _now - entry.createdAt <= 24 * 60 * 60 * 1000).map((entry) => entry.locator));
     for (const file of validFiles) {
       const blob = await this.readFile(file);
       if (!blob || blob.size !== file.bytes) {
@@ -142,27 +140,62 @@ export class OpfsModelCacheBackend implements ModelCacheBlobBackend {
       }
     }
     for await (const [modelId, modelHandle] of this.root.entries()) {
+      if (modelHandle.kind === 'file') {
+        if (modelId.startsWith('.tmp-') || modelId.endsWith('.crswap')) {
+          try {
+            const file = await (modelHandle as FileSystemFileHandle).getFile();
+            bytesReclaimed += file.size;
+          } catch { /* ignore */ }
+          await removeOpfsFile(this.root, modelId);
+        }
+        continue;
+      }
       // Old flat OPFS packages remain untouched and are never served.
-      if (modelHandle.kind !== 'directory' || /^[a-f0-9]{64}$/.test(modelId)) continue;
+      if (/^[a-f0-9]{64}$/.test(modelId)) continue;
       for await (const [version, versionHandle] of (modelHandle as OpfsDirectory).entries()) {
-        if (versionHandle.kind !== 'directory' || !/^[a-f0-9]{64}$/.test(version)) continue;
+        if (versionHandle.kind === 'file') {
+          if (version.startsWith('.tmp-') || version.endsWith('.crswap')) {
+            try {
+              const file = await (versionHandle as FileSystemFileHandle).getFile();
+              bytesReclaimed += file.size;
+            } catch { /* ignore */ }
+            await removeOpfsFile(modelHandle as OpfsDirectory, version);
+          }
+          continue;
+        }
+        if (!/^[a-f0-9]{64}$/.test(version)) continue;
         const directory = versionHandle as OpfsDirectory;
         for await (const [name, handle] of directory.entries()) {
           if (handle.kind === 'directory' && name === '_metadata') {
             const metadata = handle as OpfsDirectory;
             for await (const [temporaryName, temporary] of metadata.entries()) {
-              if (temporary.kind === 'file' && temporaryName.startsWith('.tmp-')) {
+              if (temporary.kind === 'file' && (temporaryName.startsWith('.tmp-') || temporaryName.endsWith('.crswap'))) {
+                try {
+                  const file = await (temporary as FileSystemFileHandle).getFile();
+                  bytesReclaimed += file.size;
+                } catch { /* ignore */ }
                 await removeOpfsFile(metadata, temporaryName);
               }
             }
+            continue;
           }
           if (handle.kind !== 'file') continue;
-          if ((name.startsWith('.tmp-') && !resumable.has(`${modelId}/${version}/${name}`)) || (/^[a-f0-9]{64}\.blob$/.test(name) && !validByLocator.has(`${modelId}/${version}/${name}`))) {
+          if (name.startsWith('.tmp-') || name.endsWith('.crswap')) {
+            try {
+              const file = await (handle as FileSystemFileHandle).getFile();
+              bytesReclaimed += file.size;
+            } catch { /* ignore */ }
+            await removeOpfsFile(directory, name);
+          } else if (/^[a-f0-9]{64}\.blob$/.test(name) && !validByLocator.has(`${modelId}/${version}/${name}`)) {
+            try {
+              const file = await (handle as FileSystemFileHandle).getFile();
+              bytesReclaimed += file.size;
+            } catch { /* ignore */ }
             await removeOpfsFile(directory, name);
           }
         }
       }
     }
-    return missing;
+    return { missing, bytesReclaimed };
   }
 }

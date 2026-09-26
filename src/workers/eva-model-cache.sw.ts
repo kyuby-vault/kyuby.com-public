@@ -159,14 +159,34 @@ function clientRootKey(clientId: string, rootKey: string): string {
   return JSON.stringify([clientId, rootKey]);
 }
 
+let booted = false;
+async function bootReconcile(store: ModelCacheStore): Promise<void> {
+  if (booted) return;
+  booted = true;
+  try {
+    const result = await store.reconcile();
+    diagnostics.record({ kind: 'scratch-cleanup', total: result.bytesReclaimed });
+  } catch (error) {
+    diagnostics.record({ kind: 'error', code: acquisitionDiagnosticError(error) });
+  }
+}
+
 function getStore(): Promise<ModelCacheStore | null> {
   if (__EVA_MODEL_CACHE_DEV__ && developmentBackend === 'none') {
     return Promise.resolve(null);
   }
-  storePromise ??= openPersistentModelCacheStore(
-    Date.now,
-    __EVA_MODEL_CACHE_DEV__ && developmentBackend !== 'none' ? developmentBackend : 'auto',
-  ).catch(() => null);
+  storePromise ??= (async () => {
+    try {
+      const store = await openPersistentModelCacheStore(
+        Date.now,
+        __EVA_MODEL_CACHE_DEV__ && developmentBackend !== 'none' ? developmentBackend : 'auto',
+      );
+      await bootReconcile(store);
+      return store;
+    } catch {
+      return null;
+    }
+  })();
   return storePromise;
 }
 
@@ -1704,8 +1724,7 @@ self.addEventListener('install', (event) => {
 
 self.addEventListener('activate', (event) => {
   event.waitUntil((async () => {
-    const store = await getStore();
-    await store?.reconcile();
+    await getStore();
     await self.clients.claim();
   })());
 });

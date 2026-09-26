@@ -7,7 +7,7 @@ export const ACQUISITION_DIAGNOSTIC_MAX_BYTES = 256 * 1024;
 export const DIAGNOSTIC_LIMITS = { sw: { events: 400, bytes: 192 * 1024 }, page: { events: 100, bytes: 64 * 1024 } };
 const encoder = new TextEncoder();
 const kinds = new Set(['phase', 'retry', 'range', 'range-response', 'full-fetch', 'heartbeat-ack',
-  'lease', 'error', 'preflight', 'wake-lock', 'package-complete']);
+  'lease', 'error', 'preflight', 'wake-lock', 'package-complete', 'scratch-cleanup']);
 const numbers = new Set(['start', 'end', 'total', 'received', 'verified', 'attempt', 'status', 'gapMs', 'elapsedMs', 'usage', 'quota']);
 const labels = new Set(['code', 'phase', 'transport']);
 

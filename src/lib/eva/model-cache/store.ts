@@ -115,7 +115,7 @@ export interface ModelCacheBlobBackend {
   deleteFile(record: ModelCacheFileRecord): Promise<void>;
   deleteTemporary(record: ModelCacheTemporaryRecord): Promise<void>;
   corruptFileForDevelopment?(record: ModelCacheFileRecord): Promise<void>;
-  reconcile(validFiles: ModelCacheFileRecord[], now: number): Promise<Set<string>>;
+  reconcile(validFiles: ModelCacheFileRecord[], now: number): Promise<{ missing: Set<string>; bytesReclaimed: number }>;
 }
 
 export interface ModelCacheStoreOptions {
@@ -657,22 +657,25 @@ export class ModelCacheStore {
     return freed;
   }
 
-  async reconcile(): Promise<void> {
+  async reconcile(): Promise<{ missing: Set<string>; bytesReclaimed: number }> {
     const now = this.#now();
     const files = await this.#metadata.listFiles();
-    const missingFileKeys = await this.#backend.reconcile(files, now);
+    const { missing: missingFileKeys, bytesReclaimed } = await this.#backend.reconcile(files, now);
     for (const file of files) {
       if (missingFileKeys.has(file.key)) {
         await this.#metadata.deleteFile(file.key);
       }
     }
 
-    const staleTemps = (await this.#metadata.listTemporary()).filter(
-      (temp) => now - temp.createdAt > MODEL_CACHE_TEMP_MAX_AGE_MS,
-    );
-    for (const temp of staleTemps) {
-      await this.#backend.deleteTemporary(temp);
-      await this.#metadata.deleteTemporary(temp.id);
+    const temporaries = await this.#metadata.listTemporary();
+    for (const temp of temporaries) {
+      if (temp.resume) {
+        temp.resume.offset = 0;
+        await this.#metadata.putTemporary(temp);
+      } else {
+        await this.#backend.deleteTemporary(temp);
+        await this.#metadata.deleteTemporary(temp.id);
+      }
     }
 
     const packages = await this.#metadata.listPackages();
@@ -692,6 +695,7 @@ export class ModelCacheStore {
       }
       await this.#refreshCompleteness(packageRecord, manifest.inventory);
     }
+    return { missing: missingFileKeys, bytesReclaimed };
   }
 
   close(): void {
