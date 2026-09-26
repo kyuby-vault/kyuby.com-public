@@ -1,3 +1,4 @@
+import { getBootEpoch } from './boot-epoch';
 import { hashBytes, ModelIntegrityError, verifyBlobIntegrity } from './integrity';
 import { normalizeStrongModelCacheEtag } from './manifest';
 import {
@@ -115,7 +116,11 @@ export interface ModelCacheBlobBackend {
   deleteFile(record: ModelCacheFileRecord): Promise<void>;
   deleteTemporary(record: ModelCacheTemporaryRecord): Promise<void>;
   corruptFileForDevelopment?(record: ModelCacheFileRecord): Promise<void>;
-  reconcile(validFiles: ModelCacheFileRecord[], now: number): Promise<{ missing: Set<string>; bytesReclaimed: number }>;
+  reconcile(
+    validFiles: ModelCacheFileRecord[],
+    now: number,
+    options?: { isBoot?: boolean; forceCleanup?: boolean },
+  ): Promise<{ missing: Set<string>; bytesReclaimed: number }>;
 }
 
 export interface ModelCacheStoreOptions {
@@ -657,24 +662,28 @@ export class ModelCacheStore {
     return freed;
   }
 
-  async reconcile(): Promise<{ missing: Set<string>; bytesReclaimed: number }> {
+  async reconcile(options?: { isBoot?: boolean; forceCleanup?: boolean }): Promise<{ missing: Set<string>; bytesReclaimed: number }> {
     const now = this.#now();
     const files = await this.#metadata.listFiles();
-    const { missing: missingFileKeys, bytesReclaimed } = await this.#backend.reconcile(files, now);
+    const { missing: missingFileKeys, bytesReclaimed } = await this.#backend.reconcile(files, now, options);
     for (const file of files) {
       if (missingFileKeys.has(file.key)) {
         await this.#metadata.deleteFile(file.key);
       }
     }
 
-    const temporaries = await this.#metadata.listTemporary();
-    for (const temp of temporaries) {
-      if (temp.resume) {
-        temp.resume.offset = 0;
-        await this.#metadata.putTemporary(temp);
-      } else {
-        await this.#backend.deleteTemporary(temp);
-        await this.#metadata.deleteTemporary(temp.id);
+    const { current: bootEpoch, lastCleanup } = await getBootEpoch();
+    const shouldCleanScratch = options?.forceCleanup || (options?.isBoot ?? (bootEpoch === 0 || bootEpoch > lastCleanup));
+    if (shouldCleanScratch) {
+      const temporaries = await this.#metadata.listTemporary();
+      for (const temp of temporaries) {
+        if (temp.resume) {
+          temp.resume.offset = 0;
+          await this.#metadata.putTemporary(temp);
+        } else {
+          await this.#backend.deleteTemporary(temp);
+          await this.#metadata.deleteTemporary(temp.id);
+        }
       }
     }
 

@@ -210,6 +210,32 @@ export async function verifyBlobIntegrity(
   return assertModelIntegrity(result, expectation);
 }
 
+export interface ShardPrecheckResult {
+  valid: boolean;
+  reason?: 'empty-file' | 'size-mismatch' | 'read-failed';
+  actualBytes?: number;
+}
+
+export async function verifyShardPrecheck(
+  source: Blob | { getFile: () => Promise<Blob> },
+  expectedBytes: number,
+): Promise<ShardPrecheckResult> {
+  try {
+    const file = typeof (source as { getFile?: unknown }).getFile === 'function'
+      ? await (source as { getFile: () => Promise<Blob> }).getFile()
+      : (source as Blob);
+    if (file.size === 0 && expectedBytes > 0) {
+      return { valid: false, reason: 'empty-file', actualBytes: 0 };
+    }
+    if (file.size !== expectedBytes) {
+      return { valid: false, reason: 'size-mismatch', actualBytes: file.size };
+    }
+    return { valid: true, actualBytes: file.size };
+  } catch {
+    return { valid: false, reason: 'read-failed' };
+  }
+}
+
 export function createModelIntegrityTransform(
   expectation: ModelIntegrityExpectation,
 ): ModelIntegrityTransform {

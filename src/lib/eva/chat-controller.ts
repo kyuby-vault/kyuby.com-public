@@ -98,7 +98,7 @@ import { acquisitionDiagnosticError, acquisitionDiagnosticsJson, copyAcquisition
 import { AcquisitionWakeLock } from './model-cache/wake-lock';
 import { ACQUISITION_NOTICES, acquisitionCapacity, acquisitionDevicePolicy, acquisitionFailureCode, terminateFailedLoad,
   type AcquisitionCapacity, type AcquisitionNoticeCode } from './model-cache/resilience';
-import { probeStorageAdmission } from './model-cache/storage-admission';
+import { evaluateMemoryAdvisory, probeStorageAdmission } from './model-cache/storage-admission';
 import {
   INITIAL_MODEL_CACHE_UI_STATE,
   MODEL_CACHE_CORRUPTION_WARNING,
@@ -540,14 +540,10 @@ export async function mountEvaChat(): Promise<void> {
   const clearDialog = requiredElement<HTMLDialogElement>('clear-dialog');
   const confirmClearButton = requiredElement<HTMLButtonElement>('confirm-clear');
   const mobileMemoryDialog = requiredElement<HTMLDialogElement>('mobile-memory-dialog');
+  const mobileMemoryTitle = mobileMemoryDialog.querySelector<HTMLElement>('#mobile-memory-title, h2');
+  const mobileMemoryCopy = requiredElement<HTMLElement>('mobile-memory-copy');
   const confirmMobileMemoryButton = requiredElement<HTMLButtonElement>('confirm-mobile-memory');
   let mobileMemoryWarningAccepted = false;
-
-  function hasLimitedMemory(): boolean {
-    const nav = navigator as Navigator & { deviceMemory?: number };
-    if (typeof nav.deviceMemory === 'number' && nav.deviceMemory > 0 && nav.deviceMemory < 6) return true;
-    return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || '');
-  }
   const sessionsPanel = requiredElement<HTMLElement>('sessions-panel');
   const inspector = requiredElement<HTMLElement>('inspector');
   const drawerScrim = requiredElement<HTMLElement>('drawer-scrim');
@@ -2254,7 +2250,11 @@ export async function mountEvaChat(): Promise<void> {
     }
   });
   function triggerLoadWithMemoryCheck(): void {
-    if (!mobileMemoryWarningAccepted && hasLimitedMemory()) {
+    const totalBytes = cacheStatus?.totalBytes ?? modelConfig?.manifest.cacheInventory?.totalBytes ?? 0;
+    const advisory = evaluateMemoryAdvisory(totalBytes);
+    if (!mobileMemoryWarningAccepted && advisory.kind !== 'none') {
+      if (mobileMemoryTitle) mobileMemoryTitle.textContent = advisory.title;
+      mobileMemoryCopy.textContent = advisory.copy;
       mobileMemoryDialog.showModal();
       return;
     }

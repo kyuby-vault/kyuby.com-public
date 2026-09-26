@@ -1,4 +1,5 @@
-import { ModelIntegrityError, verifyBlobIntegrity } from './integrity';
+import { getBootEpoch, markCleanupComplete } from './boot-epoch';
+import { ModelIntegrityError, verifyBlobIntegrity, verifyShardPrecheck } from './integrity';
 import {
   isMissingOpfsEntry, opfsDirectory, opfsOpaqueName, opfsPackagePath,
   promoteOpfsFile, removeOpfsFile, writeOpfsStream, type OpfsDirectory,
@@ -66,8 +67,16 @@ export class OpfsModelCacheBackend implements ModelCacheBlobBackend {
           offset = completed;
         });
       } else await writeOpfsStream(temporaryHandle, source);
+      const file = await temporaryHandle.getFile();
+      const precheck = await verifyShardPrecheck(file, record.bytes);
+      if (!precheck.valid) {
+        throw new ModelIntegrityError(
+          'LENGTH_MISMATCH',
+          `Shard integrity precheck failed: ${precheck.reason} (expected ${record.bytes}, got ${precheck.actualBytes ?? 0}).`,
+        );
+      }
       // Hash the on-disk temp file once before atomic promotion.
-      await verifyBlobIntegrity(await temporaryHandle.getFile(), { bytes: record.bytes, sha256: record.sha256 },
+      await verifyBlobIntegrity(file, { bytes: record.bytes, sha256: record.sha256 },
         { onProgress: options.onVerifyProgress });
       options.assertCanCommit?.();
       await promoteOpfsFile(temporaryHandle, finalName);
@@ -128,7 +137,11 @@ export class OpfsModelCacheBackend implements ModelCacheBlobBackend {
     await writeOpfsStream(await directory.getFileHandle(parts[1]), new Blob([new ArrayBuffer(record.bytes)]));
   }
 
-  async reconcile(validFiles: ModelCacheFileRecord[], _now: number): Promise<{ missing: Set<string>; bytesReclaimed: number }> {
+  async reconcile(
+    validFiles: ModelCacheFileRecord[],
+    _now: number,
+    options?: { isBoot?: boolean; forceCleanup?: boolean },
+  ): Promise<{ missing: Set<string>; bytesReclaimed: number }> {
     let bytesReclaimed = 0;
     const missing = new Set<string>();
     const validByLocator = new Map(validFiles.map((file) => [file.locator, file]));
@@ -139,54 +152,23 @@ export class OpfsModelCacheBackend implements ModelCacheBlobBackend {
         await this.deleteFile(file);
       }
     }
+
+    // Only clean orphaned scratch if this is a boot reconcile or cleanup is explicitly forced/epoch is uncleaned
+    const { current: bootEpoch, lastCleanup } = await getBootEpoch();
+    const shouldCleanScratch = options?.forceCleanup || (options?.isBoot ?? (bootEpoch === 0 || bootEpoch > lastCleanup));
+    if (shouldCleanScratch) {
+      const scratchResult = await cleanupOrphanedScratch(this.root, this.repository, true);
+      bytesReclaimed += scratchResult.bytesReclaimed;
+    }
+
+    // Always clean unreferenced complete .blob files (orphaned blobs from aborted removals)
     for await (const [modelId, modelHandle] of this.root.entries()) {
-      if (modelHandle.kind === 'file') {
-        if (modelId.startsWith('.tmp-') || modelId.endsWith('.crswap')) {
-          try {
-            const file = await (modelHandle as FileSystemFileHandle).getFile();
-            bytesReclaimed += file.size;
-          } catch { /* ignore */ }
-          await removeOpfsFile(this.root, modelId);
-        }
-        continue;
-      }
-      // Old flat OPFS packages remain untouched and are never served.
-      if (/^[a-f0-9]{64}$/.test(modelId)) continue;
+      if (modelHandle.kind !== 'directory' || /^[a-f0-9]{64}$/.test(modelId)) continue;
       for await (const [version, versionHandle] of (modelHandle as OpfsDirectory).entries()) {
-        if (versionHandle.kind === 'file') {
-          if (version.startsWith('.tmp-') || version.endsWith('.crswap')) {
-            try {
-              const file = await (versionHandle as FileSystemFileHandle).getFile();
-              bytesReclaimed += file.size;
-            } catch { /* ignore */ }
-            await removeOpfsFile(modelHandle as OpfsDirectory, version);
-          }
-          continue;
-        }
-        if (!/^[a-f0-9]{64}$/.test(version)) continue;
+        if (versionHandle.kind !== 'directory' || !/^[a-f0-9]{64}$/.test(version)) continue;
         const directory = versionHandle as OpfsDirectory;
         for await (const [name, handle] of directory.entries()) {
-          if (handle.kind === 'directory' && name === '_metadata') {
-            const metadata = handle as OpfsDirectory;
-            for await (const [temporaryName, temporary] of metadata.entries()) {
-              if (temporary.kind === 'file' && (temporaryName.startsWith('.tmp-') || temporaryName.endsWith('.crswap'))) {
-                try {
-                  const file = await (temporary as FileSystemFileHandle).getFile();
-                  bytesReclaimed += file.size;
-                } catch { /* ignore */ }
-                await removeOpfsFile(metadata, temporaryName);
-              }
-            }
-            continue;
-          }
-          if (handle.kind !== 'file') continue;
-          if (name.startsWith('.tmp-') || name.endsWith('.crswap')) {
-            try {
-              const file = await (handle as FileSystemFileHandle).getFile();
-              bytesReclaimed += file.size;
-            } catch { /* ignore */ }
-            await removeOpfsFile(directory, name);
-          } else if (/^[a-f0-9]{64}\.blob$/.test(name) && !validByLocator.has(`${modelId}/${version}/${name}`)) {
+          if (handle.kind === 'file' && /^[a-f0-9]{64}\.blob$/.test(name) && !validByLocator.has(`${modelId}/${version}/${name}`)) {
             try {
               const file = await (handle as FileSystemFileHandle).getFile();
               bytesReclaimed += file.size;
@@ -196,6 +178,94 @@ export class OpfsModelCacheBackend implements ModelCacheBlobBackend {
         }
       }
     }
+
     return { missing, bytesReclaimed };
   }
+}
+
+export async function cleanupOrphanedScratch(
+  root: OpfsDirectory,
+  repository?: ModelCacheMetadataRepository,
+  force = false,
+): Promise<{ bytesReclaimed: number; filesRemoved: number }> {
+  const { current: bootEpoch, lastCleanup } = await getBootEpoch();
+  if (!force && bootEpoch > 0 && bootEpoch <= lastCleanup) {
+    return { bytesReclaimed: 0, filesRemoved: 0 };
+  }
+
+  let bytesReclaimed = 0;
+  let filesRemoved = 0;
+
+  for await (const [modelId, modelHandle] of root.entries()) {
+    if (modelHandle.kind === 'file') {
+      if (modelId.includes('.tmp-resume-') || modelId.startsWith('.tmp-') || modelId.endsWith('.crswap')) {
+        try {
+          const file = await (modelHandle as FileSystemFileHandle).getFile();
+          bytesReclaimed += file.size;
+          filesRemoved++;
+        } catch { /* ignore */ }
+        await removeOpfsFile(root, modelId);
+      }
+      continue;
+    }
+    if (/^[a-f0-9]{64}$/.test(modelId)) continue;
+    for await (const [version, versionHandle] of (modelHandle as OpfsDirectory).entries()) {
+      if (versionHandle.kind === 'file') {
+        if (version.includes('.tmp-resume-') || version.startsWith('.tmp-') || version.endsWith('.crswap')) {
+          try {
+            const file = await (versionHandle as FileSystemFileHandle).getFile();
+            bytesReclaimed += file.size;
+            filesRemoved++;
+          } catch { /* ignore */ }
+          await removeOpfsFile(modelHandle as OpfsDirectory, version);
+        }
+        continue;
+      }
+      if (!/^[a-f0-9]{64}$/.test(version)) continue;
+      const directory = versionHandle as OpfsDirectory;
+      for await (const [name, handle] of directory.entries()) {
+        if (handle.kind === 'directory' && name === '_metadata') {
+          const metadata = handle as OpfsDirectory;
+          for await (const [temporaryName, temporary] of metadata.entries()) {
+            if (temporary.kind === 'file' && (temporaryName.includes('.tmp-resume-') || temporaryName.startsWith('.tmp-') || temporaryName.endsWith('.crswap'))) {
+              try {
+                const file = await (temporary as FileSystemFileHandle).getFile();
+                bytesReclaimed += file.size;
+                filesRemoved++;
+              } catch { /* ignore */ }
+              await removeOpfsFile(metadata, temporaryName);
+            }
+          }
+          continue;
+        }
+        if (handle.kind !== 'file') continue;
+        if (name.includes('.tmp-resume-') || name.startsWith('.tmp-') || name.endsWith('.crswap')) {
+          try {
+            const file = await (handle as FileSystemFileHandle).getFile();
+            bytesReclaimed += file.size;
+            filesRemoved++;
+          } catch { /* ignore */ }
+          await removeOpfsFile(directory, name);
+        }
+      }
+    }
+  }
+
+  if (repository) {
+    const temporaries = await repository.listTemporary();
+    for (const temp of temporaries) {
+      if (temp.resume) {
+        temp.resume.offset = 0;
+        await repository.putTemporary(temp);
+      } else {
+        await repository.deleteTemporary(temp.id);
+      }
+    }
+  }
+
+  if (bootEpoch > 0) {
+    await markCleanupComplete(bootEpoch);
+  }
+
+  return { bytesReclaimed, filesRemoved };
 }

@@ -1,5 +1,6 @@
 /// <reference lib="webworker" />
 
+import { initBootEpoch } from '../lib/eva/model-cache/boot-epoch';
 import { ModelIntegrityError, verifyBlobIntegrity } from '../lib/eva/model-cache/integrity';
 import { assertModelMemoryFallback } from '../lib/eva/model-cache/memory-fallback-policy';
 import { ModelDigestTimeoutError } from '../lib/eva/model-cache/digest-scheduler';
@@ -164,7 +165,7 @@ async function bootReconcile(store: ModelCacheStore): Promise<void> {
   if (booted) return;
   booted = true;
   try {
-    const result = await store.reconcile();
+    const result = await store.reconcile({ isBoot: true });
     diagnostics.record({ kind: 'scratch-cleanup', total: result.bytesReclaimed });
   } catch (error) {
     diagnostics.record({ kind: 'error', code: acquisitionDiagnosticError(error) });
@@ -1719,12 +1720,18 @@ async function handleArtifactFetch(
 }
 
 self.addEventListener('install', (event) => {
-  event.waitUntil(self.skipWaiting());
+  event.waitUntil((async () => {
+    await initBootEpoch();
+    await self.skipWaiting();
+  })());
 });
 
 self.addEventListener('activate', (event) => {
   event.waitUntil((async () => {
-    await getStore();
+    const store = await getStore();
+    if (store) {
+      await store.reconcile({ isBoot: true });
+    }
     await self.clients.claim();
   })());
 });
