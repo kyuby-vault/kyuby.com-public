@@ -78,24 +78,22 @@ export async function probeStorageAdmission(
     return { state: 'cache-unavailable', code: 'cache-unavailable', cause: 'opfs-unavailable', message, persisted, opfsAvailable, usage, quota };
   }
 
-  // 2. Capacity / Quota check
-  const remaining = Math.max(0, requiredBytes - cachedBytes);
-  const available = (quota !== null && usage !== null) ? Math.max(0, quota - usage) : null;
-  const headroom = Math.max(Math.ceil(requiredBytes * 0.1), MINIMUM_STORAGE_HEADROOM);
-
-  if (quota === 0 || (available !== null && remaining > 0 && available < remaining + headroom)) {
+  // 2. Capacity / Quota check: block ONLY on quota < requiredBytes (or quota === 0)
+  if (quota === 0 || (quota !== null && quota < requiredBytes)) {
     const message = isSafariOrIos()
-      ? 'Safari storage limit reached or Private Browsing detected. Please disable Private Browsing or allow persistent storage to download the model.'
+      ? 'iOS Safari storage limit reached. Free device storage or close other tabs to download the model.'
       : 'Not enough device storage. Free browser storage or remove an old cached model, then retry. Space for the model plus safety headroom is required.';
     const cause = quota === 0 ? 'quota-null' : 'low-quota';
     return { state: 'insufficient-storage', code: 'insufficient-storage', cause, message, persisted, opfsAvailable, usage, quota };
   }
 
-  // 3. Persistence check
+  // 3. Persistence check: persist()=false / best-effort = warn + proceed
   if (!persisted) {
     const message = isAndroidDevice()
       ? 'Android eviction risk: persistent storage was not granted. The browser or operating system may clear cached files under storage pressure.'
-      : 'Storage is best-effort. The browser or operating system may clear cached files under storage pressure.';
+      : isSafariOrIos()
+        ? 'iOS Safari manages storage automatically. Model files are stored best-effort and may be cleared under storage pressure.'
+        : 'Storage is best-effort. The browser or operating system may clear cached files under storage pressure.';
     return { state: 'storage-best-effort', code: 'storage-best-effort', cause: 'not-persisted', message, persisted, opfsAvailable, usage, quota };
   }
 

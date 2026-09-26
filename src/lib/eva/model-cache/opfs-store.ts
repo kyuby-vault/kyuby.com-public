@@ -155,19 +155,33 @@ export class OpfsModelCacheBackend implements ModelCacheBlobBackend {
 
     // Only clean orphaned scratch if this is a boot reconcile or cleanup is explicitly forced/epoch is uncleaned
     const { current: bootEpoch, lastCleanup } = await getBootEpoch();
-    const shouldCleanScratch = options?.forceCleanup || (options?.isBoot ?? (bootEpoch === 0 || bootEpoch > lastCleanup));
+    const isBootCleanup = Boolean(options?.isBoot || (bootEpoch > 0 && bootEpoch > lastCleanup));
+    const shouldCleanScratch = Boolean(options?.forceCleanup || isBootCleanup);
     if (shouldCleanScratch) {
       const scratchResult = await cleanupOrphanedScratch(this.root, this.repository, true);
       bytesReclaimed += scratchResult.bytesReclaimed;
     }
 
-    // Always clean unreferenced complete .blob files (orphaned blobs from aborted removals)
+    // Always clean unreferenced complete .blob files and interrupted temporary files in _metadata
     for await (const [modelId, modelHandle] of this.root.entries()) {
       if (modelHandle.kind !== 'directory' || /^[a-f0-9]{64}$/.test(modelId)) continue;
       for await (const [version, versionHandle] of (modelHandle as OpfsDirectory).entries()) {
         if (versionHandle.kind !== 'directory' || !/^[a-f0-9]{64}$/.test(version)) continue;
         const directory = versionHandle as OpfsDirectory;
         for await (const [name, handle] of directory.entries()) {
+          if (handle.kind === 'directory' && name === '_metadata') {
+            const metadata = handle as OpfsDirectory;
+            for await (const [temporaryName, temporary] of metadata.entries()) {
+              if (temporary.kind === 'file' && temporaryName.startsWith('.tmp-')) {
+                try {
+                  const file = await (temporary as FileSystemFileHandle).getFile();
+                  bytesReclaimed += file.size;
+                } catch { /* ignore */ }
+                await removeOpfsFile(metadata, temporaryName);
+              }
+            }
+            continue;
+          }
           if (handle.kind === 'file' && /^[a-f0-9]{64}\.blob$/.test(name) && !validByLocator.has(`${modelId}/${version}/${name}`)) {
             try {
               const file = await (handle as FileSystemFileHandle).getFile();

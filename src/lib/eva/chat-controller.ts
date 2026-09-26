@@ -1645,7 +1645,7 @@ export async function mountEvaChat(): Promise<void> {
         acquisitionNotice('cache-unavailable', admission.message);
         throw new Error(admission.message);
       }
-      if (!diskOnly && (capacity === 'insufficient' || admission.state === 'insufficient-storage')) {
+      if (!diskOnly && admission.state === 'insufficient-storage') {
         acquisitionFailure = 'insufficient-storage';
         acquisitionNotice('insufficient-storage', admission.message);
         throw new DOMException(admission.message, 'QuotaExceededError');

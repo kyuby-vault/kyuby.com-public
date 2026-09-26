@@ -1,4 +1,4 @@
-import { getBootEpoch } from './boot-epoch';
+import { getBootEpoch, markCleanupComplete } from './boot-epoch';
 import { hashBytes, ModelIntegrityError, verifyBlobIntegrity } from './integrity';
 import { normalizeStrongModelCacheEtag } from './manifest';
 import {
@@ -673,7 +673,8 @@ export class ModelCacheStore {
     }
 
     const { current: bootEpoch, lastCleanup } = await getBootEpoch();
-    const shouldCleanScratch = options?.forceCleanup || (options?.isBoot ?? (bootEpoch === 0 || bootEpoch > lastCleanup));
+    const isBootCleanup = Boolean(options?.isBoot || (bootEpoch > 0 && bootEpoch > lastCleanup));
+    const shouldCleanScratch = Boolean(options?.forceCleanup || isBootCleanup);
     if (shouldCleanScratch) {
       const temporaries = await this.#metadata.listTemporary();
       for (const temp of temporaries) {
@@ -684,6 +685,9 @@ export class ModelCacheStore {
           await this.#backend.deleteTemporary(temp);
           await this.#metadata.deleteTemporary(temp.id);
         }
+      }
+      if (bootEpoch > 0) {
+        await markCleanupComplete(bootEpoch);
       }
     }
 
